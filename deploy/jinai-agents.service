@@ -1,0 +1,16 @@
+[Unit]
+Description=Jinai Agents (API, web app, scheduler, runner)
+After=network.target postgresql.service docker.service
+
+[Service]
+User=jinai
+WorkingDirectory=/opt/jinai-agents/backend
+EnvironmentFile=/etc/jinai-agents.env
+# 0.0.0.0 so agent containers can reach the AI endpoint via host.docker.internal.
+# Keep port 8300 closed in the GCP firewall; nginx serves the public site.
+ExecStart=/opt/jinai-agents/venv/bin/jinai-agents serve --host 0.0.0.0 --port 8300
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

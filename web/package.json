@@ -1,0 +1,28 @@
+{
+  "name": "jinai-agents-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3300",
+    "build": "next build",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@codemirror/lang-markdown": "6.3.2",
+    "@codemirror/lang-python": "6.2.1",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.15",
+    "@fontsource/instrument-sans": "5.2.6",
+    "@fontsource/jetbrains-mono": "5.2.6",
+    "@uiw/react-codemirror": "4.23.12",
+    "next": "15.5.27",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.29",
+    "@types/react": "19.1.6",
+    "@types/react-dom": "19.1.5",
+    "typescript": "5.8.3"
+  }
+}
