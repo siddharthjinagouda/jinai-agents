@@ -10,7 +10,13 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { AgentDetail, Msg, RunBrief, ago, api, money, until } from "@/lib/api";
 import { RunStrip, Status, TopBar } from "@/lib/ui";
 
-type Tab = "steps" | "code" | "settings";
+type Tab = "steps" | "code" | "store" | "memory" | "approvals" | "analytics" | "settings";
+
+interface StoreRow { id: string; created_at: string; [k: string]: unknown }
+interface MemoryItem { id: string; text: string; tags: string[]; created_at: string }
+interface Approval { id: string; run_id: string; agent_id: string; message: string; context: Record<string, unknown> | null; created_at: string; expires_at: string | null }
+interface AnalyticsDay { date: string; total: number; success: number; success_rate: number; cost: number; avg_duration_s: number | null }
+interface Analytics { total_runs: number; success_rate: number | null; total_cost: number; avg_cost_per_run: number | null; daily: AnalyticsDay[]; step_breakdown: { name: string; total: number; failures: number; failure_rate: number }[] }
 
 export default function Page() {
   return (
@@ -27,6 +33,12 @@ function AgentPage() {
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [runs, setRuns] = useState<RunBrief[]>([]);
   const [tab, setTab] = useState<Tab>("steps");
+  const [storeTables, setStoreTables] = useState<{ name: string; count: number }[]>([]);
+  const [storeTable, setStoreTable] = useState("");
+  const [storeRows, setStoreRows] = useState<StoreRow[]>([]);
+  const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [analytics, setAnalytics] = useState<Analytics | null>(null);
   const [files, setFiles] = useState<Record<string, string>>({});
   const [activeFile, setActiveFile] = useState("agent.py");
   const [localDirty, setLocalDirty] = useState(false);
@@ -39,6 +51,24 @@ function AgentPage() {
   const dirtyRef = useRef(false);
   const viewRef = useRef<EditorView | null>(null);
   const pendingLine = useRef<number | null>(null);
+
+  const loadTab = useCallback(async (t: Tab) => {
+    if (!id) return;
+    if (t === "store") {
+      const r = await api<{ tables: { name: string; count: number }[] }>(`/api/agents/${id}/store`);
+      setStoreTables(r.tables);
+      if (r.tables.length && !storeTable) setStoreTable(r.tables[0].name);
+    } else if (t === "memory") {
+      const r = await api<{ items: MemoryItem[] }>(`/api/agents/${id}/memory`);
+      setMemoryItems(r.items);
+    } else if (t === "approvals") {
+      const r = await api<Approval[]>(`/api/approvals`);
+      setApprovals(r.filter((a: Approval) => a.agent_id === id));
+    } else if (t === "analytics") {
+      const r = await api<Analytics>(`/api/agents/${id}/analytics`);
+      setAnalytics(r);
+    }
+  }, [id, storeTable]);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -63,6 +93,10 @@ function AgentPage() {
   useEffect(() => {
     load().catch((e) => setError(e.message));
   }, [load]);
+
+  useEffect(() => {
+    loadTab(tab).catch(() => {});
+  }, [tab, loadTab]);
 
   const busy = agent?.builder_busy ?? false;
   useEffect(() => {
@@ -220,14 +254,23 @@ function AgentPage() {
         <ChatPane id={id} msgs={msgs} busy={busy} activity={agent.builder_activity} onSent={load} />
 
         <section className="pane editor-pane" aria-label="Agent">
-          <div className="pane-head" style={{ padding: "0 8px" }} role="tablist">
-            {(["steps", "code", "settings"] as Tab[]).map((t) => (
-              <button key={t} role="tab" className="tab" aria-selected={tab === t} onClick={() => setTab(t)}>
-                {t === "steps" ? "Steps" : t === "code" ? "Code" : "Settings"}
+          <div className="pane-head" style={{ padding: "0 8px", overflowX: "auto" }} role="tablist">
+            {(["steps","code","store","memory","approvals","analytics","settings"] as Tab[]).map((t) => (
+              <button key={t} role="tab" className="tab" aria-selected={tab === t} onClick={() => setTab(t)}
+                style={{ whiteSpace: "nowrap" }}>
+                {t === "steps" ? "Steps" : t === "code" ? "Code" : t === "store" ? "Store" : t === "memory" ? "Memory" : t === "approvals" ? "Approvals" : t === "analytics" ? "Analytics" : "Settings"}
               </button>
             ))}
           </div>
           {tab === "steps" && <StepsView agent={agent} outline={outline} hasCode={!!files["agent.py"]} busy={busy} onJump={jumpTo} />}
+          {tab === "store" && (
+            <StoreView agentId={id} tables={storeTables} activeTable={storeTable} rows={storeRows}
+              onTableChange={async (t) => { setStoreTable(t); const r = await api<{ table: string; total: number; rows: StoreRow[] }>(`/api/agents/${id}/store/${t}`); setStoreRows(r.rows); }}
+              onLoad={async () => { if (storeTable) { const r = await api<{ table: string; total: number; rows: StoreRow[] }>(`/api/agents/${id}/store/${storeTable}`); setStoreRows(r.rows); } }} />
+          )}
+          {tab === "memory" && <MemoryView agentId={id} items={memoryItems} onDelete={async (itemId) => { await api(`/api/agents/${id}/memory/${itemId}`, { method: "DELETE" }); setMemoryItems((x) => x.filter((i) => i.id !== itemId)); }} />}
+          {tab === "approvals" && <ApprovalsView approvals={approvals} onRespond={async (apId, approved) => { await api(`/api/approvals/${apId}/respond`, { body: { approved } }); await loadTab("approvals"); }} />}
+          {tab === "analytics" && <AnalyticsView analytics={analytics} />}
           {tab === "code" && (
             <>
               <div className="files" role="tablist" aria-label="Files">
@@ -630,5 +673,161 @@ function RunsPane({ id, runs, memory, reload }: { id: string; runs: RunBrief[]; 
         {Object.keys(memory).length === 0 ? <p className="hint">Nothing yet. Values saved with state.set() appear after a successful run.</p> : <pre>{JSON.stringify(memory, null, 1)}</pre>}
       </div>
     </section>
+  );
+}
+
+// ------------------------------------------------------------------ store
+function StoreView({ agentId, tables, activeTable, rows, onTableChange, onLoad }: {
+  agentId: string; tables: { name: string; count: number }[]; activeTable: string;
+  rows: StoreRow[]; onTableChange: (t: string) => void; onLoad: () => void;
+}) {
+  const cols = rows.length > 0 ? Array.from(new Set(rows.flatMap((r) => Object.keys(r)))) : [];
+  return (
+    <div className="pane-body">
+      {tables.length === 0 ? (
+        <p className="empty">No store tables yet. Use <code>store.insert("tablename", …)</code> from an agent run.</p>
+      ) : (
+        <>
+          <div className="files" role="tablist" style={{ marginBottom: 8 }}>
+            {tables.map((t) => (
+              <button key={t.name} role="tab" className="file" aria-selected={activeTable === t.name}
+                onClick={() => onTableChange(t.name)}>
+                {t.name} <span style={{ opacity: 0.5, fontSize: 11 }}>({t.count})</span>
+              </button>
+            ))}
+          </div>
+          {rows.length === 0 ? (
+            <p className="hint">Table is empty.</p>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr>{cols.map((c) => <th key={c} style={{ padding: "6px 8px", textAlign: "left", borderBottom: "1px solid var(--border)" }}>{c}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr key={row.id} style={{ borderBottom: "1px solid var(--border)" }}>
+                      {cols.map((c) => <td key={c} style={{ padding: "5px 8px", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{JSON.stringify(row[c] ?? "")}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ memory
+function MemoryView({ agentId, items, onDelete }: { agentId: string; items: MemoryItem[]; onDelete: (id: string) => void }) {
+  return (
+    <div className="pane-body">
+      {items.length === 0 ? (
+        <p className="empty">No memories yet. Use <code>memory.remember("fact")</code> from an agent run.</p>
+      ) : (
+        <div>
+          {items.map((item) => (
+            <div key={item.id} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14 }}>{item.text}</div>
+                {item.tags?.length > 0 && <div style={{ fontSize: 11, opacity: 0.5, marginTop: 2 }}>{item.tags.join(", ")}</div>}
+              </div>
+              <button className="btn ghost small" onClick={() => onDelete(item.id)}>Forget</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ approvals
+function ApprovalsView({ approvals, onRespond }: { approvals: Approval[]; onRespond: (id: string, approved: boolean) => void }) {
+  return (
+    <div className="pane-body">
+      {approvals.length === 0 ? (
+        <p className="empty">No pending approvals. Use <code>wait_for_human("message")</code> from an agent run to pause and ask here.</p>
+      ) : (
+        <div>
+          {approvals.map((ap) => (
+            <div key={ap.id} style={{ padding: "12px 0", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>{ap.message}</div>
+              {ap.context && <pre style={{ fontSize: 12, opacity: 0.7, margin: "4px 0" }}>{JSON.stringify(ap.context, null, 2)}</pre>}
+              <div style={{ fontSize: 12, opacity: 0.5, marginBottom: 8 }}>
+                Run {ap.run_id} · {ap.expires_at ? `Expires ${new Date(ap.expires_at).toLocaleString()}` : ""}
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn primary small" onClick={() => onRespond(ap.id, true)}>Approve</button>
+                <button className="btn ghost small" onClick={() => onRespond(ap.id, false)}>Reject</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ analytics
+function AnalyticsView({ analytics }: { analytics: Analytics | null }) {
+  if (!analytics) return <div className="pane-body"><p className="empty">Loading…</p></div>;
+  const { total_runs, success_rate, total_cost, avg_cost_per_run, daily, step_breakdown } = analytics;
+  const pct = (n: number | null) => n == null ? "—" : `${Math.round(n * 100)}%`;
+  const usd = (n: number | null) => n == null ? "—" : `$${n.toFixed(4)}`;
+  return (
+    <div className="pane-body">
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12, marginBottom: 24 }}>
+        {[
+          ["Runs (30d)", String(total_runs)],
+          ["Success rate", pct(success_rate)],
+          ["Total AI cost", usd(total_cost)],
+          ["Avg cost / run", usd(avg_cost_per_run)],
+        ].map(([label, val]) => (
+          <div key={label} style={{ padding: "12px 16px", border: "1px solid var(--border)", borderRadius: 8 }}>
+            <div style={{ fontSize: 11, opacity: 0.5, marginBottom: 4 }}>{label}</div>
+            <div style={{ fontSize: 22, fontWeight: 700 }}>{val}</div>
+          </div>
+        ))}
+      </div>
+
+      {daily.length > 0 && (
+        <>
+          <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Daily runs (last 30 days)</h3>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 80, marginBottom: 20 }}>
+            {daily.map((d) => {
+              const h = Math.max(4, Math.round((d.total / Math.max(...daily.map((x) => x.total), 1)) * 80));
+              const col = d.success_rate >= 0.9 ? "var(--ok, #22c55e)" : d.success_rate >= 0.5 ? "#f59e0b" : "#ef4444";
+              return (
+                <div key={d.date} title={`${d.date}: ${d.total} runs, ${pct(d.success_rate)} success`}
+                  style={{ flex: 1, height: h, background: col, borderRadius: 2, minWidth: 2, cursor: "default" }} />
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {step_breakdown.length > 0 && (
+        <>
+          <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Step failure breakdown</h3>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr>{["Step", "Runs", "Failures", "Fail rate"].map((h) => <th key={h} style={{ textAlign: "left", padding: "4px 8px", opacity: 0.6 }}>{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {step_breakdown.map((s) => (
+                <tr key={s.name} style={{ borderTop: "1px solid var(--border)" }}>
+                  <td style={{ padding: "4px 8px" }}>{s.name}</td>
+                  <td style={{ padding: "4px 8px" }}>{s.total}</td>
+                  <td style={{ padding: "4px 8px", color: s.failures > 0 ? "#ef4444" : undefined }}>{s.failures}</td>
+                  <td style={{ padding: "4px 8px" }}>{pct(s.failure_rate)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+    </div>
   );
 }

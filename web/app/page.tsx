@@ -15,6 +15,8 @@ interface Summary {
   ai_cost_month: number;
   runs_24h: number;
 }
+interface WsSecret { name: string; updated_at: string }
+interface WorkspaceAnalytics { agents: { agent_id: string; name: string; runs_30d: number; success_rate: number | null; cost_30d: number }[]; total_cost_30d: number }
 interface FeedItem {
   id: number;
   agent_id: string;
@@ -48,6 +50,11 @@ export default function Home() {
   const [request, setRequest] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [wsSecrets, setWsSecrets] = useState<WsSecret[]>([]);
+  const [wsSecretName, setWsSecretName] = useState("");
+  const [wsSecretValue, setWsSecretValue] = useState("");
+  const [wsAnalytics, setWsAnalytics] = useState<WorkspaceAnalytics | null>(null);
+  const [showWorkspace, setShowWorkspace] = useState(false);
 
   async function load() {
     const [a, s, f] = await Promise.all([api<AgentRow[]>("/api/agents"), api<Summary>("/api/summary"), api<FeedItem[]>("/api/events?limit=12")]);
@@ -56,12 +63,37 @@ export default function Home() {
     setFeed(f);
   }
 
+  async function loadWorkspace() {
+    const [secs, an] = await Promise.all([
+      api<WsSecret[]>("/api/workspace/secrets"),
+      api<WorkspaceAnalytics>("/api/workspace/analytics"),
+    ]);
+    setWsSecrets(secs);
+    setWsAnalytics(an);
+  }
+
+  async function saveWsSecret() {
+    if (!wsSecretName || !wsSecretValue) return;
+    await api(`/api/workspace/secrets/${wsSecretName}`, { method: "PUT", body: { value: wsSecretValue } });
+    setWsSecretName(""); setWsSecretValue("");
+    await loadWorkspace();
+  }
+
+  async function deleteWsSecret(name: string) {
+    await api(`/api/workspace/secrets/${name}`, { method: "DELETE" });
+    await loadWorkspace();
+  }
+
   useEffect(() => {
     load().catch((e) => setError(e.message));
     api("/api/me").then(setMe).catch(() => {});
     const t = setInterval(() => load().catch(() => {}), 5000);
     return () => clearInterval(t);
   }, []);
+
+  useEffect(() => {
+    if (showWorkspace) loadWorkspace().catch(() => {});
+  }, [showWorkspace]);
 
   async function create() {
     if (request.trim().length < 5) return;
@@ -78,8 +110,62 @@ export default function Home() {
 
   return (
     <>
-      <TopBar />
-      <main className="home">
+      <TopBar>
+        <button className="btn ghost small" style={{ marginLeft: "auto" }} onClick={() => setShowWorkspace(!showWorkspace)}>
+          {showWorkspace ? "← Agents" : "Workspace ⚙"}
+        </button>
+      </TopBar>
+      {showWorkspace && (
+        <main style={{ maxWidth: 760, margin: "0 auto", padding: "32px 16px" }}>
+          <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 24 }}>Workspace</h1>
+
+          <section style={{ marginBottom: 32 }}>
+            <h2 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>Shared Secrets</h2>
+            <p style={{ fontSize: 13, opacity: 0.6, marginBottom: 12 }}>Available to ALL agents via <code>secret("NAME", scope="workspace")</code>. Stored encrypted.</p>
+            {wsSecrets.map((s) => (
+              <div key={s.name} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+                <span style={{ flex: 1, fontFamily: "monospace", fontSize: 13 }}>{s.name}</span>
+                <span style={{ fontSize: 12, opacity: 0.5 }}>Set</span>
+                <button className="btn ghost small" onClick={() => deleteWsSecret(s.name)}>Remove</button>
+              </div>
+            ))}
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <input className="field mono" placeholder="SECRET_NAME" value={wsSecretName}
+                onChange={(e) => setWsSecretName(e.target.value.toUpperCase())} style={{ flex: 1 }} />
+              <input className="field" type="password" placeholder="Value" value={wsSecretValue}
+                onChange={(e) => setWsSecretValue(e.target.value)} style={{ flex: 2 }} />
+              <button className="btn" disabled={!wsSecretName || !wsSecretValue} onClick={saveWsSecret}>Save</button>
+            </div>
+          </section>
+
+          {wsAnalytics && (
+            <section>
+              <h2 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>Cross-agent Analytics (30 days)</h2>
+              <div style={{ marginBottom: 12, fontSize: 13 }}>
+                Total AI cost: <b>${wsAnalytics.total_cost_30d.toFixed(4)}</b>
+              </div>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr>{["Agent", "Runs", "Success rate", "AI cost"].map((h) => (
+                    <th key={h} style={{ textAlign: "left", padding: "4px 8px", opacity: 0.6 }}>{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {wsAnalytics.agents.map((a) => (
+                    <tr key={a.agent_id} style={{ borderTop: "1px solid var(--border)" }}>
+                      <td style={{ padding: "4px 8px" }}><a href={`/agent/?id=${a.agent_id}`}>{a.name}</a></td>
+                      <td style={{ padding: "4px 8px" }}>{a.runs_30d}</td>
+                      <td style={{ padding: "4px 8px" }}>{a.success_rate == null ? "—" : `${Math.round(a.success_rate * 100)}%`}</td>
+                      <td style={{ padding: "4px 8px" }}>${a.cost_30d.toFixed(4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+        </main>
+      )}
+      {!showWorkspace && <main className="home">
         <div>
           <div className="compose">
             <h1>What should your agent do?</h1>
@@ -178,7 +264,7 @@ export default function Home() {
             <div className="notice">Email isn't set up, so alerts are kept in each run instead of being sent. Add SMTP settings to send them.</div>
           )}
         </aside>
-      </main>
+      </main>}
     </>
   );
 }
