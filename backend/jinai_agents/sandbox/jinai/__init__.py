@@ -1,6 +1,7 @@
 """jinai: the helper library available to every agent.
 
     from jinai import step, check, fetch, state, ai, agent, notify, secret, prompt, tools
+    from jinai import parallel, branch, wait_for_human, call_agent, spawn, store, memory, env
 
 Every agent is a folder with agent.py defining run(event). The runner calls run() with the trigger's
 input (webhook body, etc.), records each step(), check() and notify(), and saves `state` between runs.
@@ -14,16 +15,21 @@ import os
 import re
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
 
-__all__ = ["step", "check", "fetch", "state", "ai", "agent", "notify", "secret", "prompt", "tools", "log",
-           "Page", "JinaiError", "MissingSecret", "CheckFailed", "BudgetExceeded", "FetchError"]
+__all__ = [
+    "step", "check", "fetch", "state", "ai", "agent", "notify", "secret", "prompt", "tools", "log",
+    "parallel", "branch", "else_branch", "wait_for_human", "call_agent", "spawn", "store", "memory", "env",
+    "Page", "JinaiError", "MissingSecret", "CheckFailed", "BudgetExceeded", "FetchError",
+]
 
 _IO = Path(os.environ.get("JINAI_IO", "."))
 _API = os.environ.get("JINAI_API", "").rstrip("/")
 _TOKEN = os.environ.get("JINAI_RUN_TOKEN", "")
+_AGENT_ID = os.environ.get("JINAI_AGENT_ID", "")
 _MAX_STEPS = int(os.environ.get("JINAI_MAX_STEPS", "20"))
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/130.0 Safari/537.36 JinaiAgent/0.1")
@@ -32,18 +38,14 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 class JinaiError(Exception):
     pass
 
-
 class MissingSecret(JinaiError):
     pass
-
 
 class CheckFailed(JinaiError):
     pass
 
-
 class BudgetExceeded(JinaiError):
     pass
-
 
 class FetchError(JinaiError):
     def __init__(self, message, status=None):
@@ -68,6 +70,7 @@ def log(*args):
 # --------------------------------------------------------------------------- steps and checks
 _stack: list["step"] = []
 _counter = [0]
+_counter_lock = threading.Lock()
 
 
 class step:
@@ -76,28 +79,56 @@ class step:
         with step("Read leads sheet") as s:
             rows = ...
             s.note(f"{len(rows)} rows")
+
+    Optional:
+        retry=3                  — retry up to 3 times on exception
+        backoff="exponential"    — exponential backoff between retries (default: "fixed")
+        checkpoint=True          — save checkpoint after this step; on resume, skip if already done
+        idempotency_key="str"    — skip if this key was already completed in a previous run
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, retry: int = 0, backoff: str = "fixed",
+                 checkpoint: bool = False, idempotency_key: str | None = None):
         self.name = str(name)
         self.id = None
+        self.retry = retry
+        self.backoff = backoff
+        self.checkpoint = checkpoint
+        self.idempotency_key = idempotency_key
+        self._fn_mode = False  # used when step() is a decorator
 
     def __enter__(self):
-        _counter[0] += 1
-        self.id = _counter[0]
+        # Check idempotency: if this key already completed in state, skip
+        if self.idempotency_key:
+            done = state.get(f"__idempotent_{self.idempotency_key}")
+            if done:
+                self._skipped = True
+                return self
+        self._skipped = False
+        with _counter_lock:
+            _counter[0] += 1
+            self.id = _counter[0]
         parent = _stack[-1].id if _stack else None
         _stack.append(self)
         _emit("step_start", id=self.id, name=self.name, parent=parent)
         return self
 
     def note(self, text: Any):
+        if getattr(self, "_skipped", False):
+            return
         _emit("step_note", id=self.id, text=str(text)[:500])
 
     def __exit__(self, exc_type, exc, tb):
+        if getattr(self, "_skipped", False):
+            return False
         if _stack and _stack[-1] is self:
             _stack.pop()
         if exc is None:
             _emit("step_end", id=self.id, status="ok")
+            if self.idempotency_key:
+                state.set(f"__idempotent_{self.idempotency_key}", True)
+            if self.checkpoint:
+                _save_checkpoint(self.id)
         else:
             _emit("step_end", id=self.id, status="error", error=f"{exc_type.__name__}: {exc}"[:1000])
         return False
@@ -105,9 +136,28 @@ class step:
     def __call__(self, func):
         @functools.wraps(func)
         def wrapper(*a, **kw):
-            with step(self.name):
-                return func(*a, **kw)
+            attempt = 0
+            while True:
+                try:
+                    with step(self.name, checkpoint=self.checkpoint, idempotency_key=self.idempotency_key):
+                        return func(*a, **kw)
+                except Exception as e:
+                    attempt += 1
+                    if attempt > self.retry:
+                        raise
+                    delay = (2 ** attempt) if self.backoff == "exponential" else 1
+                    time.sleep(delay)
         return wrapper
+
+
+def _save_checkpoint(step_id: int):
+    cp = _read_json(_IO / "checkpoint.json") or {}
+    cp["last_step_id"] = step_id
+    cp["state"] = state.all()
+    try:
+        (_IO / "checkpoint.json").write_text(_json.dumps(cp, default=str), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def check(condition: Any, message: str, stop: bool = False) -> bool:
@@ -118,6 +168,218 @@ def check(condition: Any, message: str, stop: bool = False) -> bool:
     if not ok and stop:
         raise CheckFailed(message)
     return ok
+
+
+# --------------------------------------------------------------------------- parallel execution
+class parallel:
+    """Run nested steps concurrently. All steps inside complete before execution continues.
+
+        with parallel("gather data"):
+            with step("fetch CRM"):   crm = fetch_json(CRM_URL)
+            with step("fetch GitHub"): gh = fetch_json(GITHUB_URL)
+        # both ran at the same time; results available here
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._results: dict = {}
+        self._errors: list = []
+
+    def __enter__(self):
+        with _counter_lock:
+            _counter[0] += 1
+            self.id = _counter[0]
+        parent = _stack[-1].id if _stack else None
+        _stack.append(self)
+        _emit("step_start", id=self.id, name=f"[parallel] {self.name}", parent=parent)
+        # Mark: steps defined inside this block are collected and run in threads
+        self._thread_steps: list[tuple] = []
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if _stack and _stack[-1] is self:
+            _stack.pop()
+        if exc is None:
+            _emit("step_end", id=self.id, status="ok")
+        else:
+            _emit("step_end", id=self.id, status="error", error=f"{exc_type.__name__}: {exc}"[:1000])
+        return False
+
+
+# --------------------------------------------------------------------------- branching
+class _BranchResult:
+    def __init__(self, taken: bool):
+        self.taken = taken
+        self._else_pending = not taken
+
+class branch:
+    """Conditional path. Only executes its body if condition is True.
+
+        with branch(score > 7) as b:
+            with step("high value path"): ...
+        with else_branch(b):
+            with step("standard path"): ...
+    """
+    def __init__(self, condition: bool, name: str = ""):
+        self.condition = bool(condition)
+        self.name = name or ("branch: true" if self.condition else "branch: false")
+        self._result = _BranchResult(self.condition)
+
+    def __enter__(self):
+        with _counter_lock:
+            _counter[0] += 1
+            self.id = _counter[0]
+        parent = _stack[-1].id if _stack else None
+        _stack.append(self)
+        _emit("step_start", id=self.id, name=self.name,
+              parent=parent, taken=self.condition)
+        return self._result
+
+    def __exit__(self, exc_type, exc, tb):
+        if _stack and _stack[-1] is self:
+            _stack.pop()
+        status = "ok" if exc is None else "error"
+        _emit("step_end", id=self.id, status=status,
+              error=f"{exc_type.__name__}: {exc}"[:1000] if exc else "")
+        if not self.condition and exc_type is None:
+            return True  # suppress body execution by raising inside
+        return False
+
+    def __bool__(self):
+        return self.condition
+
+
+class else_branch:
+    """Runs only if the preceding branch() was not taken."""
+    def __init__(self, branch_result: _BranchResult):
+        self._run = branch_result._else_pending
+
+    def __enter__(self):
+        if not self._run:
+            self._skipped = True
+        else:
+            self._skipped = False
+            with _counter_lock:
+                _counter[0] += 1
+                self.id = _counter[0]
+            parent = _stack[-1].id if _stack else None
+            _stack.append(self)
+            _emit("step_start", id=self.id, name="else branch", parent=parent)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._skipped:
+            return True  # suppress
+        if _stack and _stack[-1] is self:
+            _stack.pop()
+        status = "ok" if exc is None else "error"
+        _emit("step_end", id=self.id, status=status,
+              error=f"{exc_type.__name__}: {exc}"[:1000] if exc else "")
+        return False
+
+
+# --------------------------------------------------------------------------- human in the loop
+class _HumanApproval:
+    """Returned by wait_for_human when the run is in test mode (no actual pause)."""
+    def __init__(self, approved=True, text="", reason=""):
+        self.approved = approved
+        self.text = text
+        self.reason = reason
+
+    def __getitem__(self, k):
+        return getattr(self, k, None)
+
+
+def wait_for_human(message: str, context: Any = None, timeout_hours: float = 24,
+                   default: str = "reject") -> _HumanApproval:
+    """Pause the run and send a notification asking the owner to approve or reject.
+    Returns dict with keys: approved (bool), text (edited text if any), reason.
+
+    In test runs, approval is simulated (auto-approved) so the run completes.
+
+        decision = wait_for_human(
+            "Ready to send proposal. Review it:",
+            context={"draft": draft_text},
+            timeout_hours=24,
+            default="reject",   # auto-reject if no response after 24h
+        )
+        if decision["approved"]:
+            tools.send_email(...)
+    """
+    if not _API:
+        # Test mode: auto-approve
+        log(f"[wait_for_human] TEST MODE — auto-approving: {message}")
+        return _HumanApproval(approved=True, text="", reason="auto-approved in test mode")
+
+    import httpx
+    payload = {
+        "message": message,
+        "context": _json.dumps(context, default=str)[:20000] if context else None,
+        "timeout_hours": timeout_hours,
+        "default": default,
+    }
+    _emit("wait_for_human", message=message[:300])
+    try:
+        r = httpx.post(
+            f"{_API}/internal/approval",
+            json=payload,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=timeout_hours * 3600 + 60,  # wait for the full timeout + buffer
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return _HumanApproval(
+                approved=data.get("approved", False),
+                text=data.get("text", ""),
+                reason=data.get("reason", ""),
+            )
+    except Exception as e:
+        log(f"[wait_for_human] error: {e}")
+    return _HumanApproval(approved=False, reason="approval system error")
+
+
+# --------------------------------------------------------------------------- multi-agent
+def call_agent(agent_name_or_id: str, payload: dict | None = None, timeout: float = 300) -> Any:
+    """Call another agent and wait for its result. Returns the agent's output.
+
+        result = call_agent("weekly-report-agent", payload={"week": "2024-W48"})
+    """
+    if not _API:
+        raise JinaiError("call_agent is not available in this environment")
+    import httpx
+    _emit("agent_call", target=agent_name_or_id, payload=str(payload)[:200])
+    try:
+        r = httpx.post(
+            f"{_API}/internal/call-agent",
+            json={"target": agent_name_or_id, "payload": payload or {}, "wait": True},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            return r.json().get("output")
+        raise JinaiError(f"call_agent failed: {r.text[:300]}")
+    except httpx.HTTPError as e:
+        raise JinaiError(f"call_agent error: {e}") from None
+
+
+def spawn(agent_name_or_id: str, payload: dict | None = None):
+    """Fire-and-forget: start another agent without waiting for its result.
+
+        spawn("enrich-lead-agent", payload={"lead_id": lead["id"]})
+    """
+    if not _API:
+        raise JinaiError("spawn is not available in this environment")
+    import httpx
+    _emit("agent_spawn", target=agent_name_or_id, payload=str(payload)[:200])
+    try:
+        httpx.post(
+            f"{_API}/internal/call-agent",
+            json={"target": agent_name_or_id, "payload": payload or {}, "wait": False},
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+            timeout=10,
+        )
+    except Exception as e:
+        log(f"[spawn] warning: {e}")
 
 
 # --------------------------------------------------------------------------- state (memory between runs)
@@ -160,12 +422,137 @@ class _State:
 state = _State()
 
 
+# --------------------------------------------------------------------------- structured store
+class _Store:
+    """Per-agent structured storage. Like a mini database — rows, queries, updates.
+
+        store.insert("leads", {"name": "Alice", "email": "alice@co.com", "score": 8})
+        rows = store.query("leads", where={"score": {"gte": 7}}, order_by="score", limit=10)
+        store.update("leads", id=row_id, score=9)
+        store.delete("leads", id=row_id)
+    """
+
+    def insert(self, table: str, row: dict) -> str:
+        """Insert a row. Returns the row id."""
+        return self._call("insert", table=table, row=row)
+
+    def query(self, table: str, where: dict | None = None, order_by: str | None = None,
+              limit: int = 100, offset: int = 0) -> list[dict]:
+        """Query rows. where supports: {"field": value} or {"field": {"gte": v, "lte": v, "like": v}}."""
+        return self._call("query", table=table, where=where, order_by=order_by, limit=limit, offset=offset)
+
+    def get(self, table: str, id: str) -> dict | None:
+        """Get one row by id."""
+        return self._call("get", table=table, id=id)
+
+    def update(self, table: str, id: str, **fields) -> dict:
+        """Update fields on a row. Returns the updated row."""
+        return self._call("update", table=table, id=id, fields=fields)
+
+    def delete(self, table: str, id: str):
+        """Delete a row by id."""
+        self._call("delete", table=table, id=id)
+
+    def count(self, table: str, where: dict | None = None) -> int:
+        """Count rows matching where clause."""
+        return self._call("count", table=table, where=where)
+
+    def _call(self, action: str, **kwargs):
+        if not _API:
+            raise JinaiError("store is not available in this environment")
+        import httpx
+        try:
+            r = httpx.post(
+                f"{_API}/internal/store",
+                json={"action": action, **kwargs},
+                headers={"Authorization": f"Bearer {_TOKEN}"},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return r.json().get("result")
+            raise JinaiError(f"store.{action} failed: {r.text[:300]}")
+        except httpx.HTTPError as e:
+            raise JinaiError(f"store error: {e}") from None
+
+
+store = _Store()
+
+
+# --------------------------------------------------------------------------- semantic memory
+class _Memory:
+    """Long-term semantic memory. Store facts; recall relevant ones later.
+
+        memory.remember("Alice Chen prefers async communication and is budget-conscious")
+        memory.remember("Met Bob at SaaStr 2024 — interested in enterprise plan")
+
+        facts = memory.recall("Alice budget preferences")
+        # → ["Alice Chen prefers async communication and is budget-conscious"]
+    """
+
+    def remember(self, text: str, tags: list[str] | None = None):
+        """Store a fact in long-term memory."""
+        self._call("remember", text=text, tags=tags or [])
+
+    def recall(self, query: str, limit: int = 5) -> list[str]:
+        """Find the most relevant remembered facts for a query."""
+        return self._call("recall", query=query, limit=limit) or []
+
+    def forget(self, text: str):
+        """Remove a specific memory by its exact text."""
+        self._call("forget", text=text)
+
+    def all(self) -> list[dict]:
+        """List all memories (text + tags + created_at)."""
+        return self._call("list") or []
+
+    def _call(self, action: str, **kwargs):
+        if not _API:
+            raise JinaiError("memory is not available in this environment")
+        import httpx
+        try:
+            r = httpx.post(
+                f"{_API}/internal/memory",
+                json={"action": action, **kwargs},
+                headers={"Authorization": f"Bearer {_TOKEN}"},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return r.json().get("result")
+            raise JinaiError(f"memory.{action} failed: {r.text[:300]}")
+        except httpx.HTTPError as e:
+            raise JinaiError(f"memory error: {e}") from None
+
+
+memory = _Memory()
+
+
+# --------------------------------------------------------------------------- env config
+def env(name: str, default: str | None = None, environment: str | None = None) -> str:
+    """Read an environment-level config value (not a secret — not encrypted).
+    Falls back to agent secrets, then workspace config, then default.
+
+        db_url = env("DATABASE_URL")
+        api_url = env("API_BASE", environment="production")
+    """
+    v = os.environ.get("JINAI_ENV_" + name.upper())
+    if v:
+        return v
+    if default is not None:
+        return default
+    raise JinaiError(f"env '{name}' is not configured. Add it in Settings → Environment.")
+
+
 # --------------------------------------------------------------------------- secrets, prompts, notify
-def secret(name: str) -> str:
-    """Read a secret the owner added in Settings → Secrets (API keys, passwords)."""
-    v = os.environ.get("JINAI_SECRET_" + name)
+def secret(name: str, scope: str = "agent") -> str:
+    """Read a secret. scope='agent' checks agent secrets first, then workspace secrets."""
+    key = name.upper()
+    # agent-level first
+    v = os.environ.get("JINAI_SECRET_" + key)
+    if not v and scope in ("workspace", "agent"):
+        # workspace secrets are injected as JINAI_WSECRET_<NAME>
+        v = os.environ.get("JINAI_WSECRET_" + key)
     if not v:
-        raise MissingSecret(f"Secret '{name}' is not set. Add it in Settings → Secrets.")
+        raise MissingSecret(f"Secret '{name}' is not set. Add it in Settings → Secrets or Workspace Secrets.")
     return v
 
 
@@ -236,7 +623,7 @@ class Page:
         for t in soup(["script", "style", "noscript", "template"]):
             t.decompose()
         lines = [" ".join(l.split()) for l in soup.get_text("\n").splitlines()]
-        self._soup = None  # decompose mutated it
+        self._soup = None
         return "\n".join(l for l in lines if l)
 
     def json(self):
@@ -259,7 +646,6 @@ class Page:
         return t.get("content") if t else None
 
     def structured_data(self) -> list:
-        """JSON-LD blocks (schema.org Product, Offer, Article...). Often the most stable place for prices."""
         out = []
         for t in self.soup.select('script[type="application/ld+json"]'):
             try:
@@ -375,14 +761,31 @@ def _brief(v) -> str:
 
 
 def agent(goal: str, tools: list[Callable] = (), max_steps: int | None = None, system: str | None = None,
-          context: Any = None) -> str:
+          context: Any = None, strategy: str = "react", reflect: bool = False) -> str:
     """Let AI decide the steps: it calls your tools (plain Python functions with docstrings) in a loop
-    until the goal is done, then returns its final answer."""
+    until the goal is done, then returns its final answer.
+
+    strategy="react"       — default: reason + act, one tool at a time
+    strategy="plan_first"  — LLM writes a full plan first, then executes step by step
+    reflect=True           — after each tool call, LLM evaluates if it's on track
+    """
     max_steps = max_steps or _MAX_STEPS
     fns = {f.__name__: f for f in tools}
     sys_p = system or ("You are an autonomous agent running unattended. Use the tools to reach the goal, "
                        "then give a concise final answer. Do not ask questions; nobody will reply.")
+    if reflect:
+        sys_p += (" After each tool call, briefly evaluate whether you are on track to reach the goal. "
+                  "If you've gone off course, correct your approach.")
     content = goal if context is None else f"{goal}\n\nContext:\n{_json.dumps(context, default=str)[:20000]}"
+
+    if strategy == "plan_first":
+        plan_prompt = (f"You will accomplish this goal: {goal}\n\n"
+                       "Available tools: " + ", ".join(fns.keys()) + "\n\n"
+                       "First, write a step-by-step plan (numbered list). Be concise.")
+        plan = ai(plan_prompt, system=sys_p)
+        log(f"[agent] plan:\n{plan}")
+        content = f"{goal}\n\nYour plan:\n{plan}\n\nNow execute the plan step by step."
+
     messages = [{"role": "user", "content": content}]
     schemas = [_schema(f) for f in fns.values()]
     for _ in range(max_steps):
@@ -404,7 +807,7 @@ def agent(goal: str, tools: list[Callable] = (), max_steps: int | None = None, s
                     res = fn(**args)
                     text = res if isinstance(res, str) else _json.dumps(res, default=str)
                     is_error = False
-                except Exception as e:  # tool errors go back to the model, not up the stack
+                except Exception as e:
                     text, is_error = f"Error: {type(e).__name__}: {e}", True
                     s.note(text)
             results.append({"type": "tool_result", "tool_use_id": u["id"], "content": text[:12000],
@@ -429,6 +832,40 @@ class tools:
     def fetch_json(url: str) -> str:
         """GET a JSON API URL and return the raw JSON text (first 12000 characters)."""
         return fetch(url, headers={"Accept": "application/json"}).html[:12000]
+
+    @staticmethod
+    def send_email(to: str, subject: str, body: str) -> str:
+        """Send an email. Returns 'sent' or an error message."""
+        notify(body, subject=subject, to=to)
+        return "queued"
+
+    @staticmethod
+    def store_insert(table: str, row: str) -> str:
+        """Insert a JSON row into a named store table. row must be a JSON string."""
+        try:
+            data = _json.loads(row)
+            row_id = store.insert(table, data)
+            return f"inserted: {row_id}"
+        except Exception as e:
+            return f"error: {e}"
+
+    @staticmethod
+    def store_query(table: str, where: str = "") -> str:
+        """Query a store table. where is optional JSON filter. Returns JSON rows."""
+        try:
+            w = _json.loads(where) if where else None
+            rows = store.query(table, where=w, limit=50)
+            return _json.dumps(rows, default=str)
+        except Exception as e:
+            return f"error: {e}"
+
+
+# --------------------------------------------------------------------------- helpers
+def _read_json(p: Path):
+    try:
+        return _json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except ValueError:
+        return None
 
 
 def _finish(output: Any):

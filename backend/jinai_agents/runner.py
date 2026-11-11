@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from . import config, notify
-from .db import Agent, Run, Version, now, session
+from .db import Agent, Run, Version, WorkspaceSecret, now, session
 from .store import REAL_KINDS, live_version, secret_env
 
 LOG_LIMIT = 60_000
@@ -89,11 +89,22 @@ def execute(run_id: str, files: dict | None = None):
             files = v.files
         run.status, run.started_at = "running", now()
         env_secrets = secret_env(agent)
+        # Also load workspace-level secrets (prefixed JINAI_WSECRET_)
+        ws_secrets = s.scalars(select(WorkspaceSecret)).all()
+        from .store import _fernet
+        f = _fernet()
+        for ws in ws_secrets:
+            try:
+                env_secrets["JINAI_WSECRET_" + ws.name] = f.decrypt(ws.encrypted_value.encode()).decode()
+            except Exception:
+                pass
         state_in = agent.state or {}
         timeout = agent.timeout_s
         max_steps = agent.max_steps
         token = run.token
         event = (run.input or {}).get("event") or {}
+        # Load checkpoint if the run is resuming
+        checkpoint_data = run.human_input  # reuse human_input field for checkpoint storage
 
     work = st.data_dir / "runs" / run_id
     agent_dir, io_dir = work / "agent", work / "io"
@@ -106,6 +117,8 @@ def execute(run_id: str, files: dict | None = None):
         p.write_text(content, encoding="utf-8")
     (io_dir / "input.json").write_text(json.dumps({"event": event}, default=str), encoding="utf-8")
     (io_dir / "state_in.json").write_text(json.dumps(state_in, default=str), encoding="utf-8")
+    if checkpoint_data and isinstance(checkpoint_data, dict) and checkpoint_data.get("_checkpoint"):
+        (io_dir / "checkpoint.json").write_text(json.dumps(checkpoint_data), encoding="utf-8")
 
     env = {"JINAI_RUN_TOKEN": token, "JINAI_MAX_STEPS": str(max_steps), "LANG": "C.UTF-8",
            "PYTHONUNBUFFERED": "1", **env_secrets}

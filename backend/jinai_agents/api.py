@@ -469,6 +469,507 @@ def internal_llm(body: LLMBody, authorization: str = Header(default="")):
             "cost": round(cost, 6)}
 
 
+# --------------------------------------------------------------------------- internal: structured store
+from .db import AgentCall, HumanApproval, MemoryItem, StoreRow, StoreTable, WorkspaceSecret
+
+
+class StoreBody(BaseModel):
+    action: str
+    table: str = ""
+    row: dict | None = None
+    id: str | None = None
+    fields: dict | None = None
+    where: dict | None = None
+    order_by: str | None = None
+    limit: int = 100
+    offset: int = 0
+
+
+def _resolve_run_agent(token: str, s):
+    r = s.scalars(select(Run).where(Run.token == token, Run.status == "running")).first() if token else None
+    if r is None:
+        raise HTTPException(401, "Invalid run token")
+    return r
+
+
+@app.post("/internal/store")
+def internal_store(body: StoreBody, authorization: str = Header(default="")):
+    token = authorization.removeprefix("Bearer ").strip()
+    with session() as s:
+        r = _resolve_run_agent(token, s)
+        agent_id = r.agent_id
+        action = body.action
+
+        if action == "insert":
+            row = StoreRow(agent_id=agent_id, table_name=body.table, data=body.row or {})
+            s.add(row)
+            s.flush()
+            return {"result": row.id}
+
+        elif action == "query":
+            q = select(StoreRow).where(StoreRow.agent_id == agent_id, StoreRow.table_name == body.table)
+            if body.where:
+                for field, cond in body.where.items():
+                    if isinstance(cond, dict):
+                        pass  # complex filtering done in Python below
+                    else:
+                        pass  # simple equality — filter in Python
+            rows = s.scalars(q.order_by(StoreRow.created_at.desc()).limit(body.limit).offset(body.offset)).all()
+            # apply where filter in Python (simple, works for SQLite + Postgres)
+            result = []
+            for row in rows:
+                d = {"id": row.id, "created_at": row.created_at.isoformat(), **row.data}
+                if _matches(d, body.where):
+                    result.append(d)
+            if body.order_by:
+                reverse = body.order_by.endswith(" desc")
+                key = body.order_by.removesuffix(" desc").removesuffix(" asc").strip()
+                result.sort(key=lambda x: x.get(key, ""), reverse=reverse)
+            return {"result": result}
+
+        elif action == "get":
+            row = s.get(StoreRow, body.id)
+            if row is None or row.agent_id != agent_id:
+                return {"result": None}
+            return {"result": {"id": row.id, "created_at": row.created_at.isoformat(), **row.data}}
+
+        elif action == "update":
+            row = s.get(StoreRow, body.id)
+            if row is None or row.agent_id != agent_id:
+                raise HTTPException(404, "Row not found")
+            row.data = {**row.data, **(body.fields or {})}
+            s.flush()
+            return {"result": {"id": row.id, **row.data}}
+
+        elif action == "delete":
+            row = s.get(StoreRow, body.id)
+            if row and row.agent_id == agent_id:
+                s.delete(row)
+            return {"result": "ok"}
+
+        elif action == "count":
+            q = select(func.count()).select_from(StoreRow).where(
+                StoreRow.agent_id == agent_id, StoreRow.table_name == body.table)
+            return {"result": s.scalar(q) or 0}
+
+        raise HTTPException(400, f"Unknown store action: {action}")
+
+
+def _matches(row: dict, where: dict | None) -> bool:
+    if not where:
+        return True
+    for field, cond in where.items():
+        val = row.get(field)
+        if isinstance(cond, dict):
+            if "gte" in cond and not (val is not None and val >= cond["gte"]):
+                return False
+            if "lte" in cond and not (val is not None and val <= cond["lte"]):
+                return False
+            if "like" in cond and not (val is not None and cond["like"].lower() in str(val).lower()):
+                return False
+            if "eq" in cond and val != cond["eq"]:
+                return False
+        else:
+            if val != cond:
+                return False
+    return True
+
+
+# --------------------------------------------------------------------------- internal: semantic memory
+class MemoryBody(BaseModel):
+    action: str
+    text: str = ""
+    tags: list = []
+    query: str = ""
+    limit: int = 5
+
+
+@app.post("/internal/memory")
+def internal_memory(body: MemoryBody, authorization: str = Header(default="")):
+    token = authorization.removeprefix("Bearer ").strip()
+    with session() as s:
+        r = _resolve_run_agent(token, s)
+        agent_id = r.agent_id
+
+        if body.action == "remember":
+            embedding = _embed(body.text)
+            item = MemoryItem(agent_id=agent_id, text=body.text, tags=body.tags, embedding=embedding)
+            s.add(item)
+            return {"result": "ok"}
+
+        elif body.action == "recall":
+            items = s.scalars(select(MemoryItem).where(MemoryItem.agent_id == agent_id)
+                              .order_by(MemoryItem.created_at.desc()).limit(200)).all()
+            if not items:
+                return {"result": []}
+            query_emb = _embed(body.query)
+            scored = []
+            for item in items:
+                if item.embedding:
+                    sim = _cosine(query_emb, item.embedding)
+                    scored.append((sim, item.text))
+                else:
+                    # fallback: keyword match
+                    if body.query.lower() in item.text.lower():
+                        scored.append((0.5, item.text))
+            scored.sort(reverse=True)
+            return {"result": [t for _, t in scored[:body.limit]]}
+
+        elif body.action == "forget":
+            item = s.scalars(select(MemoryItem).where(
+                MemoryItem.agent_id == agent_id, MemoryItem.text == body.text)).first()
+            if item:
+                s.delete(item)
+            return {"result": "ok"}
+
+        elif body.action == "list":
+            items = s.scalars(select(MemoryItem).where(MemoryItem.agent_id == agent_id)
+                              .order_by(MemoryItem.created_at.desc())).all()
+            return {"result": [{"id": i.id, "text": i.text, "tags": i.tags,
+                                "created_at": i.created_at.isoformat()} for i in items]}
+
+        raise HTTPException(400, f"Unknown memory action: {body.action}")
+
+
+def _embed(text: str) -> list[float]:
+    """Simple TF-style embedding using character trigrams. Good enough for recall without an embedding API."""
+    import math
+    text = text.lower()
+    tgrams: dict[str, int] = {}
+    for i in range(len(text) - 2):
+        tg = text[i:i+3]
+        tgrams[tg] = tgrams.get(tg, 0) + 1
+    if not tgrams:
+        return []
+    # hash trigrams to 128-dim vector
+    vec = [0.0] * 128
+    for tg, count in tgrams.items():
+        h = hash(tg) % 128
+        vec[h] += count
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
+
+
+# --------------------------------------------------------------------------- internal: human approvals
+import asyncio as _asyncio
+from datetime import timedelta
+
+
+class ApprovalBody(BaseModel):
+    message: str
+    context: str | None = None
+    timeout_hours: float = 24.0
+    default: str = "reject"
+
+
+@app.post("/internal/approval")
+async def internal_approval(body: ApprovalBody, authorization: str = Header(default="")):
+    """Called by wait_for_human() in running agents. Blocks until approved/rejected/timed out."""
+    token = authorization.removeprefix("Bearer ").strip()
+    with session() as s:
+        r = _resolve_run_agent(token, s)
+        run_id, agent_id = r.id, r.agent_id
+        ctx = None
+        if body.context:
+            try:
+                ctx = __import__("json").loads(body.context)
+            except Exception:
+                ctx = {"text": body.context}
+        expires = now() + timedelta(hours=body.timeout_hours)
+        approval = HumanApproval(
+            run_id=run_id, agent_id=agent_id,
+            message=body.message, context=ctx,
+            timeout_hours=body.timeout_hours,
+            default_action=body.default,
+            expires_at=expires,
+        )
+        s.add(approval)
+        s.flush()
+        approval_id = approval.id
+        r.waiting_for_human = True
+        s.add(Event(agent_id=agent_id, kind="needs_you",
+                    text=f"Waiting for approval: {body.message[:100]}", run_id=run_id))
+
+    # Poll until responded or timed out
+    deadline = time.time() + body.timeout_hours * 3600
+    while time.time() < deadline:
+        await _asyncio.sleep(2)
+        with session() as s:
+            ap = s.get(HumanApproval, approval_id)
+            if ap and ap.status != "pending":
+                r = s.get(Run, run_id)
+                if r:
+                    r.waiting_for_human = False
+                    r.human_input = ap.response
+                return ap.response or {"approved": ap.status == "approved"}
+
+    # Timed out
+    with session() as s:
+        ap = s.get(HumanApproval, approval_id)
+        if ap:
+            ap.status = "timed_out"
+            ap.response = {"approved": body.default == "approve", "reason": "timed out"}
+        r = s.get(Run, run_id)
+        if r:
+            r.waiting_for_human = False
+    return {"approved": body.default == "approve", "reason": "timed out"}
+
+
+@app.post("/api/approvals/{approval_id}/respond", dependencies=[Depends(auth)])
+def respond_approval(approval_id: str, body: dict):
+    """Owner approves or rejects a waiting run."""
+    with session() as s:
+        ap = s.get(HumanApproval, approval_id)
+        if ap is None:
+            raise HTTPException(404, "Approval not found")
+        if ap.status != "pending":
+            raise HTTPException(409, "Already responded")
+        ap.status = "approved" if body.get("approved") else "rejected"
+        ap.response = {"approved": bool(body.get("approved")), "text": body.get("text", ""),
+                       "reason": body.get("reason", "")}
+        ap.responded_at = now()
+    return {"ok": True}
+
+
+@app.get("/api/approvals", dependencies=[Depends(auth)])
+def list_approvals():
+    """List pending human approval requests."""
+    with session() as s:
+        aps = s.scalars(select(HumanApproval).where(HumanApproval.status == "pending")
+                        .order_by(HumanApproval.created_at.desc())).all()
+        return [{"id": ap.id, "run_id": ap.run_id, "agent_id": ap.agent_id,
+                 "message": ap.message, "context": ap.context,
+                 "created_at": db.as_utc(ap.created_at).isoformat(),
+                 "expires_at": db.as_utc(ap.expires_at).isoformat() if ap.expires_at else None}
+                for ap in aps]
+
+
+# --------------------------------------------------------------------------- internal: agent-to-agent calls
+class AgentCallBody(BaseModel):
+    target: str  # agent name or id
+    payload: dict = {}
+    wait: bool = True
+
+
+@app.post("/internal/call-agent")
+def internal_call_agent(body: AgentCallBody, authorization: str = Header(default="")):
+    token = authorization.removeprefix("Bearer ").strip()
+    with session() as s:
+        r = _resolve_run_agent(token, s)
+        caller_run_id, caller_agent_id = r.id, r.agent_id
+        # resolve target by name or id
+        target = (s.scalars(select(Agent).where(Agent.name == body.target)).first()
+                  or s.get(Agent, body.target))
+        if target is None:
+            raise HTTPException(404, f"Agent '{body.target}' not found")
+        target_id = target.id
+        call = AgentCall(caller_agent_id=caller_agent_id, callee_agent_id=target_id,
+                         caller_run_id=caller_run_id, payload=body.payload, wait=body.wait)
+        s.add(call)
+        s.flush()
+        call_id = call.id
+
+    try:
+        callee_run_id = runner.queue_run(target_id, "webhook", {"caller_run_id": caller_run_id,
+                                                                 "payload": body.payload})
+        with session() as s:
+            call = s.get(AgentCall, call_id)
+            call.callee_run_id = callee_run_id
+            call.status = "running"
+    except runner.RunnerError as e:
+        with session() as s:
+            call = s.get(AgentCall, call_id)
+            call.status = "failed"
+        raise HTTPException(409, str(e))
+
+    if not body.wait:
+        return {"ok": True, "run_id": callee_run_id}
+
+    # wait for callee to finish
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(1)
+        with session() as s:
+            callee_run = s.get(Run, callee_run_id)
+            if callee_run and callee_run.status not in ("queued", "running"):
+                call = s.get(AgentCall, call_id)
+                call.status = "done" if callee_run.status == "success" else "failed"
+                call.result = {"output": callee_run.output}
+                call.finished_at = now()
+                return {"output": callee_run.output, "status": callee_run.status}
+    raise HTTPException(504, "Callee agent did not finish in time")
+
+
+# --------------------------------------------------------------------------- workspace secrets API
+@app.get("/api/workspace/secrets", dependencies=[Depends(auth)])
+def list_workspace_secrets():
+    with session() as s:
+        secs = s.scalars(select(WorkspaceSecret).order_by(WorkspaceSecret.name)).all()
+        return [{"name": sec.name, "updated_at": db.as_utc(sec.updated_at).isoformat()} for sec in secs]
+
+
+@app.put("/api/workspace/secrets/{name}", dependencies=[Depends(auth)])
+def set_workspace_secret(name: str, body: dict):
+    name = name.strip().upper()
+    value = body.get("value", "")
+    from .store import _fernet
+    with session() as s:
+        sec = s.scalars(select(WorkspaceSecret).where(WorkspaceSecret.name == name)).first()
+        if sec is None:
+            sec = WorkspaceSecret(name=name, encrypted_value="")
+            s.add(sec)
+        if value:
+            sec.encrypted_value = _fernet().encrypt(value.encode()).decode()
+        else:
+            s.delete(sec)
+    return {"ok": True}
+
+
+@app.delete("/api/workspace/secrets/{name}", dependencies=[Depends(auth)])
+def delete_workspace_secret(name: str):
+    with session() as s:
+        sec = s.scalars(select(WorkspaceSecret).where(WorkspaceSecret.name == name.upper())).first()
+        if sec:
+            s.delete(sec)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- analytics API
+@app.get("/api/agents/{agent_id}/analytics", dependencies=[Depends(auth)])
+def agent_analytics(agent_id: str):
+    """Cross-run analytics: success rate over time, cost, step failure breakdown."""
+    with session() as s:
+        a = get_agent(s, agent_id)
+        since = now() - timedelta(days=30)
+        runs = s.scalars(select(Run).where(Run.agent_id == agent_id, Run.kind.in_(REAL_KINDS),
+                                           Run.created_at >= since)
+                         .order_by(Run.created_at)).all()
+        # daily buckets
+        from collections import defaultdict
+        daily: dict = defaultdict(lambda: {"total": 0, "success": 0, "cost": 0.0, "duration_s": []})
+        step_failures: dict = defaultdict(int)
+        step_counts: dict = defaultdict(int)
+        for r in runs:
+            day = db.as_utc(r.created_at).strftime("%Y-%m-%d")
+            daily[day]["total"] += 1
+            if r.status == "success":
+                daily[day]["success"] += 1
+            daily[day]["cost"] += r.ai_cost
+            if r.started_at and r.finished_at:
+                dur = (db.as_utc(r.finished_at) - db.as_utc(r.started_at)).total_seconds()
+                daily[day]["duration_s"].append(dur)
+            for st in r.steps:
+                step_counts[st["name"]] += 1
+                if st["status"] == "error":
+                    step_failures[st["name"]] += 1
+
+        daily_list = []
+        for day in sorted(daily.keys()):
+            d = daily[day]
+            durs = d["duration_s"]
+            daily_list.append({
+                "date": day, "total": d["total"], "success": d["success"],
+                "success_rate": round(d["success"] / d["total"], 3) if d["total"] else 0,
+                "cost": round(d["cost"], 4),
+                "avg_duration_s": round(sum(durs) / len(durs), 1) if durs else None,
+            })
+
+        step_breakdown = [
+            {"name": name, "total": step_counts[name], "failures": step_failures.get(name, 0),
+             "failure_rate": round(step_failures.get(name, 0) / step_counts[name], 3) if step_counts[name] else 0}
+            for name in sorted(step_counts, key=lambda n: step_failures.get(n, 0), reverse=True)
+        ]
+
+        total_cost = sum(r.ai_cost for r in runs)
+        total_runs = len(runs)
+        success_runs = sum(1 for r in runs if r.status == "success")
+
+        return {
+            "agent_id": agent_id,
+            "period_days": 30,
+            "total_runs": total_runs,
+            "success_rate": round(success_runs / total_runs, 3) if total_runs else None,
+            "total_cost": round(total_cost, 4),
+            "avg_cost_per_run": round(total_cost / total_runs, 4) if total_runs else None,
+            "daily": daily_list,
+            "step_breakdown": step_breakdown[:20],
+        }
+
+
+@app.get("/api/workspace/analytics", dependencies=[Depends(auth)])
+def workspace_analytics():
+    """Analytics across all agents."""
+    with session() as s:
+        since = now() - timedelta(days=30)
+        agents = s.scalars(select(Agent)).all()
+        result = []
+        for a in agents:
+            runs = s.scalars(select(Run).where(Run.agent_id == a.id, Run.kind.in_(REAL_KINDS),
+                                               Run.created_at >= since)).all()
+            total = len(runs)
+            success = sum(1 for r in runs if r.status == "success")
+            cost = sum(r.ai_cost for r in runs)
+            result.append({
+                "agent_id": a.id, "name": a.name, "status": a.status,
+                "runs_30d": total,
+                "success_rate": round(success / total, 3) if total else None,
+                "cost_30d": round(cost, 4),
+            })
+        total_cost = sum(r["cost_30d"] for r in result)
+        return {"agents": result, "total_cost_30d": round(total_cost, 4)}
+
+
+# --------------------------------------------------------------------------- store rows API (for UI)
+@app.get("/api/agents/{agent_id}/store/{table}", dependencies=[Depends(auth)])
+def get_store_table(agent_id: str, table: str, limit: int = 100, offset: int = 0):
+    with session() as s:
+        get_agent(s, agent_id)
+        rows = s.scalars(select(StoreRow).where(StoreRow.agent_id == agent_id,
+                                                StoreRow.table_name == table)
+                         .order_by(StoreRow.created_at.desc()).limit(limit).offset(offset)).all()
+        total = s.scalar(select(func.count()).select_from(StoreRow).where(
+            StoreRow.agent_id == agent_id, StoreRow.table_name == table)) or 0
+        return {"table": table, "total": total, "rows": [
+            {"id": r.id, "created_at": db.as_utc(r.created_at).isoformat(), **r.data} for r in rows]}
+
+
+@app.get("/api/agents/{agent_id}/store", dependencies=[Depends(auth)])
+def list_store_tables(agent_id: str):
+    with session() as s:
+        get_agent(s, agent_id)
+        tables = s.execute(
+            select(StoreRow.table_name, func.count().label("count"))
+            .where(StoreRow.agent_id == agent_id)
+            .group_by(StoreRow.table_name)
+        ).all()
+        return {"tables": [{"name": t, "count": c} for t, c in tables]}
+
+
+@app.get("/api/agents/{agent_id}/memory", dependencies=[Depends(auth)])
+def list_memory(agent_id: str):
+    with session() as s:
+        get_agent(s, agent_id)
+        items = s.scalars(select(MemoryItem).where(MemoryItem.agent_id == agent_id)
+                          .order_by(MemoryItem.created_at.desc())).all()
+        return {"items": [{"id": i.id, "text": i.text, "tags": i.tags,
+                           "created_at": db.as_utc(i.created_at).isoformat()} for i in items]}
+
+
+@app.delete("/api/agents/{agent_id}/memory/{item_id}", dependencies=[Depends(auth)])
+def delete_memory(agent_id: str, item_id: str):
+    with session() as s:
+        item = s.get(MemoryItem, item_id)
+        if item and item.agent_id == agent_id:
+            s.delete(item)
+    return {"ok": True}
+
+
 # --------------------------------------------------------------------------- web app (static export of web/)
 @app.get("/healthz")
 def healthz():

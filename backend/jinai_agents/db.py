@@ -85,6 +85,9 @@ class Run(Base):
     ai_cost: Mapped[float] = mapped_column(Float, default=0.0)
     token: Mapped[str] = mapped_column(String(64), default=lambda: _secrets.token_urlsafe(24))
     repair_status: Mapped[str] = mapped_column(String(20), default="")  # "" | repairing | fixed | not_fixed
+    parent_run_id: Mapped[str | None] = mapped_column(String(40), nullable=True)  # set when spawned by another agent
+    waiting_for_human: Mapped[bool] = mapped_column(Boolean, default=False)
+    human_input: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -122,6 +125,88 @@ class Usage(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+
+
+# --------------------------------------------------------------------------- NEW: structured store
+class StoreTable(Base):
+    """Named table in an agent's structured store."""
+    __tablename__ = "store_tables"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("st"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class StoreRow(Base):
+    """A row in an agent's structured store."""
+    __tablename__ = "store_rows"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("sr"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    table_name: Mapped[str] = mapped_column(String(100), index=True)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+# --------------------------------------------------------------------------- NEW: semantic memory
+class MemoryItem(Base):
+    """A remembered fact for an agent (long-term semantic memory)."""
+    __tablename__ = "memory_items"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("mi"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    # embedding stored as JSON list of floats (small enough for SQLite)
+    embedding: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+
+
+# --------------------------------------------------------------------------- NEW: workspace secrets
+class WorkspaceSecret(Base):
+    """Shared secrets available to all agents in the workspace."""
+    __tablename__ = "workspace_secrets"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    encrypted_value: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+# --------------------------------------------------------------------------- NEW: human approvals
+class HumanApproval(Base):
+    """A pending human approval request from a paused run."""
+    __tablename__ = "human_approvals"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("ha"))
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # pending | approved | rejected | timed_out
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    timeout_hours: Mapped[float] = mapped_column(Float, default=24.0)
+    default_action: Mapped[str] = mapped_column(String(20), default="reject")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --------------------------------------------------------------------------- NEW: agent-to-agent calls
+class AgentCall(Base):
+    """Record of one agent calling another."""
+    __tablename__ = "agent_calls"
+    id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("ac"))
+    caller_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id", ondelete="CASCADE"), index=True)
+    callee_agent_id: Mapped[str] = mapped_column(String(40), index=True)
+    caller_run_id: Mapped[str] = mapped_column(String(40), index=True)
+    callee_run_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # pending | running | done | failed
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    wait: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 _engine = None
