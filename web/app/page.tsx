@@ -187,9 +187,14 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-              <button className="btn primary" disabled={busy || request.trim().length < 5} onClick={create}>
-                {busy ? "Starting…" : "Build agent"}
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn ghost small" onClick={() => router.push("/canvas")} title="Design a multi-step workflow visually">
+                  ⬡ Design flow
+                </button>
+                <button className="btn primary" disabled={busy || request.trim().length < 5} onClick={create}>
+                  {busy ? "Starting…" : "Build agent"}
+                </button>
+              </div>
             </div>
             {error && <p className="err" style={{ marginTop: 8 }}>{error}</p>}
           </div>

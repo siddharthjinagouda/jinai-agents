@@ -164,6 +164,92 @@ def _guess_name(text: str) -> str:
     return (" ".join(words[:6]) + ("…" if len(words) > 6 else "")).capitalize()[:80]
 
 
+# --------------------------------------------------------------------------- canvas / flow builder
+class FlowNode(BaseModel):
+    id: str
+    type: str
+    label: str
+    config: dict = {}
+
+class FlowEdge(BaseModel):
+    from_: str
+    to: str
+    condition: str | None = None
+
+    class Config:
+        populate_by_name = True
+        fields = {"from_": "from"}
+
+class NewAgentFromFlow(BaseModel):
+    flow: dict          # {nodes: [...], edges: [...]}
+    name: str = "Canvas agent"
+    agent_id: str | None = None   # if set, rebuild an existing agent
+
+
+def _flow_to_prompt(flow: dict, name: str) -> str:
+    """Turn a canvas flow schema into a natural-language build prompt for the builder."""
+    nodes = flow.get("nodes", [])
+    edges = flow.get("edges", [])
+
+    # build adjacency for readable ordering
+    adj: dict[str, list[dict]] = {}
+    for e in edges:
+        src = e.get("from") or e.get("from_", "")
+        adj.setdefault(src, []).append(e)
+
+    node_map = {n["id"]: n for n in nodes}
+
+    lines = [f'Build an agent called "{name}" that implements the following workflow:\n']
+    for n in nodes:
+        cfg = n.get("config", {})
+        desc = cfg.get("description", "")
+        line = f'- [{n["type"].upper()}] {n["label"]}'
+        if desc:
+            line += f': {desc}'
+        lines.append(line)
+        for edge in adj.get(n["id"], []):
+            target = node_map.get(edge.get("to", ""), {})
+            cond = edge.get("condition", "")
+            if cond:
+                lines.append(f'  → if {cond}: go to [{target.get("type","").upper()}] {target.get("label","")}')
+            else:
+                lines.append(f'  → then: [{target.get("type","").upper()}] {target.get("label","")}')
+
+    lines.append("\nImplement this exactly as described. Use the jinai primitives that match each node type.")
+    return "\n".join(lines)
+
+
+@app.post("/api/agents/from-flow", dependencies=[Depends(auth)])
+def create_agent_from_flow(body: NewAgentFromFlow):
+    flow = body.flow
+    if not flow.get("nodes"):
+        raise HTTPException(400, "Flow has no nodes")
+
+    prompt = _flow_to_prompt(flow, body.name)
+
+    if body.agent_id:
+        # rebuild existing agent
+        with session() as s:
+            a = get_agent(s, body.agent_id)
+            a.name = body.name
+            a.flow_schema = flow
+        builder.handle_message(body.agent_id, prompt)
+        return {"id": body.agent_id}
+    else:
+        with session() as s:
+            a = Agent(name=body.name[:80], description=prompt[:2000],
+                      alert_email=config.settings.owner_email)
+            try:
+                a.flow_schema = flow   # stored if column exists
+            except Exception:
+                pass
+            s.add(a)
+            s.flush()
+            agent_id = a.id
+        builder.handle_message(agent_id, prompt)
+        return {"id": agent_id}
+
+
 @app.get("/api/agents/{agent_id}", dependencies=[Depends(auth)])
 def get_agent_detail(agent_id: str):
     with session() as s:
