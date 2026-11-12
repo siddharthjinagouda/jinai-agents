@@ -103,6 +103,7 @@ def execute(run_id: str, files: dict | None = None):
         max_steps = agent.max_steps
         token = run.token
         event = (run.input or {}).get("event") or {}
+        tool_config = agent.tool_config or {}
         # Load checkpoint if the run is resuming
         checkpoint_data = run.human_input  # reuse human_input field for checkpoint storage
 
@@ -120,8 +121,9 @@ def execute(run_id: str, files: dict | None = None):
     if checkpoint_data and isinstance(checkpoint_data, dict) and checkpoint_data.get("_checkpoint"):
         (io_dir / "checkpoint.json").write_text(json.dumps(checkpoint_data), encoding="utf-8")
 
+    import json as _json
     env = {"JINAI_RUN_TOKEN": token, "JINAI_MAX_STEPS": str(max_steps), "LANG": "C.UTF-8",
-           "PYTHONUNBUFFERED": "1", **env_secrets}
+           "PYTHONUNBUFFERED": "1", "JINAI_TOOL_CONFIG": _json.dumps(tool_config), **env_secrets}
     if st.runner == "docker":
         rc, logs, timed_out = _run_docker(run_id, agent_dir, io_dir, env, timeout)
     else:

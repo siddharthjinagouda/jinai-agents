@@ -10,13 +10,16 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { AgentDetail, Msg, RunBrief, ago, api, money, until } from "@/lib/api";
 import { RunStrip, Status, TopBar } from "@/lib/ui";
 
-type Tab = "steps" | "code" | "store" | "memory" | "approvals" | "analytics" | "settings";
+type Tab = "steps" | "code" | "store" | "memory" | "approvals" | "analytics" | "tools" | "settings";
 
 interface StoreRow { id: string; created_at: string; [k: string]: unknown }
 interface MemoryItem { id: string; text: string; tags: string[]; created_at: string }
 interface Approval { id: string; run_id: string; agent_id: string; message: string; context: Record<string, unknown> | null; created_at: string; expires_at: string | null }
 interface AnalyticsDay { date: string; total: number; success: number; success_rate: number; cost: number; avg_duration_s: number | null }
 interface Analytics { total_runs: number; success_rate: number | null; total_cost: number; avg_cost_per_run: number | null; daily: AnalyticsDay[]; step_breakdown: { name: string; total: number; failures: number; failure_rate: number }[] }
+
+interface ToolConfigKey { key: string; label: string; type: "text" | "email" | "number" | "json" | "textarea"; hint?: string; default?: string | number }
+interface Tool { name: string; category: string; signature: string; description: string; example: string; config_keys: ToolConfigKey[] }
 
 export default function Page() {
   return (
@@ -39,6 +42,7 @@ function AgentPage() {
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [toolsCatalogue, setToolsCatalogue] = useState<Tool[]>([]);
   const [githubRepo, setGithubRepo] = useState<string | null>(null);
   const [files, setFiles] = useState<Record<string, string>>({});
   const [activeFile, setActiveFile] = useState("agent.py");
@@ -68,6 +72,9 @@ function AgentPage() {
     } else if (t === "analytics") {
       const r = await api<Analytics>(`/api/agents/${id}/analytics`);
       setAnalytics(r);
+    } else if (t === "tools") {
+      const r = await api<{ tools: Tool[] }>(`/api/tools`);
+      setToolsCatalogue(r.tools);
     }
   }, [id, storeTable]);
 
@@ -259,10 +266,10 @@ function AgentPage() {
 
         <section className="pane editor-pane" aria-label="Agent">
           <div className="pane-head" style={{ padding: "0 8px", overflowX: "auto" }} role="tablist">
-            {(["steps","code","store","memory","approvals","analytics","settings"] as Tab[]).map((t) => (
+            {(["steps","code","store","memory","approvals","analytics","tools","settings"] as Tab[]).map((t) => (
               <button key={t} role="tab" className="tab" aria-selected={tab === t} onClick={() => setTab(t)}
                 style={{ whiteSpace: "nowrap" }}>
-                {t === "steps" ? "Steps" : t === "code" ? "Code" : t === "store" ? "Store" : t === "memory" ? "Memory" : t === "approvals" ? "Approvals" : t === "analytics" ? "Analytics" : "Settings"}
+                {t === "steps" ? "Steps" : t === "code" ? "Code" : t === "store" ? "Store" : t === "memory" ? "Memory" : t === "approvals" ? "Approvals" : t === "analytics" ? "Analytics" : t === "tools" ? "Tools" : "Settings"}
               </button>
             ))}
           </div>
@@ -275,6 +282,7 @@ function AgentPage() {
           {tab === "memory" && <MemoryView agentId={id} items={memoryItems} onDelete={async (itemId) => { await api(`/api/agents/${id}/memory/${itemId}`, { method: "DELETE" }); setMemoryItems((x) => x.filter((i) => i.id !== itemId)); }} />}
           {tab === "approvals" && <ApprovalsView approvals={approvals} onRespond={async (apId, approved) => { await api(`/api/approvals/${apId}/respond`, { body: { approved } }); await loadTab("approvals"); }} />}
           {tab === "analytics" && <AnalyticsView analytics={analytics} />}
+          {tab === "tools" && <ToolsView agentId={id} catalogue={toolsCatalogue} />}
           {tab === "code" && (
             <>
               <div className="files" role="tablist" aria-label="Files">
@@ -901,6 +909,145 @@ function AnalyticsView({ analytics }: { analytics: Analytics | null }) {
             </tbody>
           </table>
         </>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ tools
+const CATEGORY_LABELS: Record<string, string> = {
+  web: "Web & HTTP", notify: "Notifications", data: "Data (Store & Memory)",
+  ai: "AI", config: "Config & Secrets", approvals: "Human in the Loop", agents: "Multi-Agent",
+};
+
+function ToolsView({ agentId, catalogue }: { agentId: string; catalogue: Tool[] }) {
+  const [config, setConfig] = useState<Record<string, Record<string, string>>>({});
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState("");
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  useEffect(() => {
+    api<{ config: Record<string, Record<string, string>> }>(`/api/agents/${agentId}/tool-config`)
+      .then((r) => setConfig(r.config || {}))
+      .catch(() => {});
+  }, [agentId]);
+
+  const setValue = (tool: string, key: string, value: string) => {
+    setConfig((prev) => ({ ...prev, [tool]: { ...(prev[tool] || {}), [key]: value } }));
+  };
+
+  const save = async () => {
+    setErr(""); setSaved(false);
+    try {
+      await api(`/api/agents/${agentId}/tool-config`, { method: "PUT", body: { config } });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  const categories = Array.from(new Set(catalogue.map((t) => t.category)));
+  const configurable = catalogue.filter((t) => t.config_keys.length > 0);
+
+  return (
+    <div className="pane-body">
+      {/* Catalogue */}
+      <div style={{ marginBottom: 32 }}>
+        {categories.map((cat) => (
+          <div key={cat} style={{ marginBottom: 20 }}>
+            <h3 style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
+              opacity: 0.5, marginBottom: 10 }}>{CATEGORY_LABELS[cat] ?? cat}</h3>
+            {catalogue.filter((t) => t.category === cat).map((tool) => (
+              <div key={tool.name} style={{ marginBottom: 8, border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
+                <button
+                  onClick={() => setExpanded(expanded === tool.name ? null : tool.name)}
+                  style={{ width: "100%", textAlign: "left", padding: "10px 14px", background: "transparent",
+                    border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 10 }}>
+                  <code style={{ fontSize: 13, fontWeight: 600, color: "var(--accent, #6366f1)" }}>{tool.name}</code>
+                  <span style={{ fontSize: 12, opacity: 0.5, flex: 1 }}>{tool.description.slice(0, 90)}{tool.description.length > 90 ? "…" : ""}</span>
+                  <span style={{ fontSize: 11, opacity: 0.4 }}>{expanded === tool.name ? "▲" : "▼"}</span>
+                </button>
+                {expanded === tool.name && (
+                  <div style={{ padding: "0 14px 14px", borderTop: "1px solid var(--border)" }}>
+                    <p style={{ fontSize: 12, opacity: 0.7, margin: "10px 0 6px" }}>{tool.description}</p>
+                    <code style={{ display: "block", fontSize: 11, opacity: 0.6, marginBottom: 10,
+                      background: "var(--code-bg, rgba(0,0,0,0.06))", padding: "6px 10px", borderRadius: 6 }}>
+                      {tool.signature}
+                    </code>
+                    {tool.example && (
+                      <pre style={{ fontSize: 12, margin: "0 0 4px", background: "var(--code-bg, rgba(0,0,0,0.06))",
+                        padding: "8px 10px", borderRadius: 6, overflowX: "auto" }}>{tool.example}</pre>
+                    )}
+                    {tool.config_keys.length > 0 && (
+                      <p style={{ fontSize: 11, opacity: 0.5, marginTop: 8 }}>
+                        ⚙ Configurable — scroll to Tool Config below
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {/* Config section */}
+      {configurable.length > 0 && (
+        <div>
+          <h2 style={{ marginBottom: 4 }}>Tool Config</h2>
+          <p className="hint" style={{ marginBottom: 16 }}>
+            These settings are applied automatically to every run of this agent — no code change needed.
+            Caller-supplied values always take precedence over these defaults.
+          </p>
+          {configurable.map((tool) => (
+            <div key={tool.name} style={{ marginBottom: 20 }}>
+              <h3 style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>
+                <code>{tool.name}</code>
+              </h3>
+              {tool.config_keys.map((ck) => (
+                <label key={ck.key} style={{ display: "block", marginBottom: 10 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>{ck.label}</span>
+                  {ck.hint && <span style={{ fontSize: 11, opacity: 0.45, marginLeft: 6 }}>— {ck.hint}</span>}
+                  {ck.type === "textarea" ? (
+                    <textarea
+                      className="field"
+                      rows={3}
+                      style={{ display: "block", width: "100%", marginTop: 4, fontFamily: "monospace", fontSize: 12 }}
+                      placeholder={String(ck.default ?? "")}
+                      value={(config[tool.name] || {})[ck.key] ?? ""}
+                      onChange={(e) => setValue(tool.name, ck.key, e.target.value)}
+                    />
+                  ) : ck.type === "json" ? (
+                    <textarea
+                      className="field mono"
+                      rows={2}
+                      style={{ display: "block", width: "100%", marginTop: 4, fontSize: 12 }}
+                      placeholder='{"Authorization": "Bearer …"}'
+                      value={typeof (config[tool.name] || {})[ck.key] === "object"
+                        ? JSON.stringify((config[tool.name] || {})[ck.key], null, 2)
+                        : ((config[tool.name] || {})[ck.key] ?? "")}
+                      onChange={(e) => {
+                        try { setValue(tool.name, ck.key, JSON.parse(e.target.value)); }
+                        catch { setValue(tool.name, ck.key, e.target.value as any); }
+                      }}
+                    />
+                  ) : (
+                    <input
+                      className={`field${ck.type === "number" ? "" : " mono"}`}
+                      type={ck.type}
+                      style={{ display: "block", width: "100%", marginTop: 4 }}
+                      placeholder={String(ck.default ?? "")}
+                      value={(config[tool.name] || {})[ck.key] ?? ""}
+                      onChange={(e) => setValue(tool.name, ck.key, e.target.value)}
+                    />
+                  )}
+                </label>
+              ))}
+            </div>
+          ))}
+          <button className="btn" onClick={save}>Save tool config</button>
+          {saved && <span style={{ marginLeft: 10, fontSize: 12, opacity: 0.6 }}>Saved ✓</span>}
+          {err && <p className="err">{err}</p>}
+        </div>
       )}
     </div>
   );

@@ -54,6 +54,8 @@ class Agent(Base):
     # GitHub integration
     github_token: Mapped[str | None] = mapped_column(Text, nullable=True)   # encrypted personal access token
     github_repo: Mapped[str | None] = mapped_column(String(200), nullable=True)  # "owner/repo"
+    # Tool configuration (per-agent overrides for built-in tools)
+    tool_config: Mapped[dict] = mapped_column(JSON, default=dict)  # e.g. {fetch: {headers: {}, timeout: 30}, notify: {from_email: "", from_name: ""}}
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 

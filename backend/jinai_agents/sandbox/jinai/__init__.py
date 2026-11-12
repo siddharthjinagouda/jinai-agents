@@ -34,6 +34,16 @@ _MAX_STEPS = int(os.environ.get("JINAI_MAX_STEPS", "20"))
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/130.0 Safari/537.36 JinaiAgent/0.1")
 
+# Per-agent tool configuration injected by the runner
+try:
+    _TOOL_CONFIG: dict = _json.loads(os.environ.get("JINAI_TOOL_CONFIG", "{}")) or {}
+except (ValueError, TypeError):
+    _TOOL_CONFIG = {}
+
+def _tcfg(tool: str) -> dict:
+    """Get tool config for a specific tool, with empty-dict fallback."""
+    return _TOOL_CONFIG.get(tool) or {}
+
 
 class JinaiError(Exception):
     pass
@@ -569,7 +579,10 @@ def prompt(name: str, **values) -> str:
 
 def notify(message: str, subject: str | None = None, to: str | None = None):
     """Send a message to the owner (or `to`). Sent after the run, only if all checks passed."""
-    _emit("notify", message=str(message)[:20000], subject=(subject or "")[:200], to=to or "")
+    nc = _tcfg("notify")
+    # Apply configured sender info (from_name, from_email) if set
+    _emit("notify", message=str(message)[:20000], subject=(subject or "")[:200], to=to or "",
+          from_name=nc.get("from_name", ""), from_email=nc.get("from_email", ""))
 
 
 # --------------------------------------------------------------------------- web
@@ -666,7 +679,17 @@ def fetch(url: str, method: str = "GET", headers: dict | None = None, params: di
     if browser:
         return _browser_fetch(url, timeout)
     import httpx
+    fc = _tcfg("fetch")
+    # Apply tool_config defaults (caller-supplied values take precedence)
+    if "timeout" in fc and timeout == 30:
+        try:
+            timeout = float(fc["timeout"])
+        except (ValueError, TypeError):
+            pass
     h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    # Apply configured default headers first, then caller headers override
+    if fc.get("default_headers") and isinstance(fc["default_headers"], dict):
+        h.update(fc["default_headers"])
     h.update(headers or {})
     try:
         r = httpx.request(method, url, headers=h, params=params, json=json, data=data, timeout=timeout,
@@ -727,12 +750,20 @@ def _strip_json(text: str):
         raise JinaiError(f"AI did not return valid JSON: {text[:200]}")
 
 
-def ai(prompt: str, system: str | None = None, json: bool = False, max_tokens: int = 1500) -> Any:
+def ai(prompt: str, system: str | None = None, json: bool = False, max_tokens: int = 1500,
+       model: str | None = None) -> Any:
     """One AI call. json=True returns parsed JSON."""
-    sys_p = system or "You are a precise assistant inside an automated agent. Answer directly."
+    ac = _tcfg("ai")
+    # Apply tool_config defaults (caller-supplied values take precedence)
+    effective_model = model or ac.get("model") or None
+    default_sys = ac.get("system", "")
+    sys_p = system or (default_sys.strip() if default_sys else "You are a precise assistant inside an automated agent. Answer directly.")
     if json:
         sys_p += " Respond with valid JSON only, no commentary."
-    out = _llm({"system": sys_p, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens})
+    payload: dict = {"system": sys_p, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens}
+    if effective_model:
+        payload["model"] = effective_model
+    out = _llm(payload)
     return _strip_json(out["text"]) if json else out["text"]
 
 
@@ -771,7 +802,11 @@ def agent(goal: str, tools: list[Callable] = (), max_steps: int | None = None, s
     """
     max_steps = max_steps or _MAX_STEPS
     fns = {f.__name__: f for f in tools}
-    sys_p = system or ("You are an autonomous agent running unattended. Use the tools to reach the goal, "
+    ac = _tcfg("ai")
+    # Apply tool_config defaults for the agent loop
+    default_sys = ac.get("system", "")
+    sys_p = system or (default_sys.strip() + "\n\nYou are an autonomous agent." if default_sys else
+                       "You are an autonomous agent running unattended. Use the tools to reach the goal, "
                        "then give a concise final answer. Do not ask questions; nobody will reply.")
     if reflect:
         sys_p += (" After each tool call, briefly evaluate whether you are on track to reach the goal. "

@@ -333,6 +333,171 @@ def put_secret(agent_id: str, body: SecretBody):
         return {"secrets_set": sorted((a.secrets_enc or {}).keys())}
 
 
+# --------------------------------------------------------------------------- tools catalogue + config
+# The catalogue of built-in tools every agent can use.
+TOOLS_CATALOGUE = [
+    {
+        "name": "fetch",
+        "category": "web",
+        "signature": "fetch(url, method='GET', headers={}, params={}, json=None, timeout=30, browser=False) → Page",
+        "description": "Fetch a web page or JSON API. Returns a Page with .text, .html, .json(), .links, .select(css).",
+        "example": "page = fetch('https://example.com')\nprint(page.text[:500])",
+        "config_keys": [
+            {"key": "default_headers", "label": "Default headers (JSON)", "type": "json",
+             "hint": "Headers added to every fetch call, e.g. {\"Authorization\": \"Bearer …\"}"},
+            {"key": "timeout", "label": "Default timeout (seconds)", "type": "number", "default": 30},
+        ],
+    },
+    {
+        "name": "tools.fetch_page",
+        "category": "web",
+        "signature": "tools.fetch_page(url) → str",
+        "description": "Shortcut for agent(): fetch a URL and return its visible text (first 8000 chars).",
+        "example": "result = agent('Summarise the news', tools=[tools.fetch_page])",
+        "config_keys": [],
+    },
+    {
+        "name": "tools.fetch_links",
+        "category": "web",
+        "signature": "tools.fetch_links(url) → list[{text, url}]",
+        "description": "Fetch a page and return its links as [{text, url}] (up to 200).",
+        "example": "links = tools.fetch_links('https://news.ycombinator.com')",
+        "config_keys": [],
+    },
+    {
+        "name": "tools.fetch_json",
+        "category": "web",
+        "signature": "tools.fetch_json(url) → str",
+        "description": "GET a JSON API and return the raw JSON text (first 12000 chars).",
+        "example": "data = tools.fetch_json('https://api.example.com/items')",
+        "config_keys": [],
+    },
+    {
+        "name": "notify",
+        "category": "notify",
+        "signature": "notify(message, subject=None, to=None)",
+        "description": "Queue a message to send to the owner after the run completes (only sent if the run succeeds).",
+        "example": "notify('Found 3 new leads this morning', subject='Daily leads report')",
+        "config_keys": [
+            {"key": "from_name", "label": "Sender name", "type": "text", "default": "Jinai Agent",
+             "hint": "Name shown in the From field of notification emails"},
+            {"key": "from_email", "label": "Sender email (override)", "type": "email",
+             "hint": "Leave blank to use the system default sender"},
+        ],
+    },
+    {
+        "name": "tools.send_email",
+        "category": "notify",
+        "signature": "tools.send_email(to, subject, body) → str",
+        "description": "Send an email to any address. Returns 'queued' or an error message.",
+        "example": "tools.send_email('client@co.com', 'Your report', report_text)",
+        "config_keys": [],
+    },
+    {
+        "name": "store",
+        "category": "data",
+        "signature": "store.insert / query / get / update / delete / count",
+        "description": "Persistent key-value store for the agent. Data survives between runs. Visible in the Store tab.",
+        "example": "store.insert('leads', {'name': 'Alice', 'email': 'alice@co.com'})\nrows = store.query('leads', where={'name': 'Alice'})",
+        "config_keys": [],
+    },
+    {
+        "name": "tools.store_insert",
+        "category": "data",
+        "signature": "tools.store_insert(table, row_json) → str",
+        "description": "Insert a JSON-encoded row into a store table. For use inside agent().",
+        "example": "agent('Save this lead', tools=[tools.store_insert])",
+        "config_keys": [],
+    },
+    {
+        "name": "memory",
+        "category": "data",
+        "signature": "memory.remember / recall / forget / all",
+        "description": "Long-term semantic memory. Store facts and retrieve relevant ones by similarity search.",
+        "example": "memory.remember('Alice Chen prefers async communication')\nfacts = memory.recall('Alice preferences')",
+        "config_keys": [],
+    },
+    {
+        "name": "ai",
+        "category": "ai",
+        "signature": "ai(prompt, model=None, system=None, json_mode=False, temperature=0) → str",
+        "description": "Call Claude with a prompt and get back text. json_mode=True returns parsed JSON.",
+        "example": "summary = ai('Summarise this article in 3 bullet points:\\n' + article_text)",
+        "config_keys": [
+            {"key": "model", "label": "AI model override", "type": "text",
+             "hint": "Leave blank to use the workspace default (claude-3-5-haiku-latest)"},
+            {"key": "system", "label": "Default system prompt", "type": "textarea",
+             "hint": "Prepended to every ai() call in this agent. E.g. 'You are a sales analyst for Acme Corp.'"},
+        ],
+    },
+    {
+        "name": "agent",
+        "category": "ai",
+        "signature": "agent(goal, tools=[], max_steps=None, system=None, context=None) → str",
+        "description": "Let Claude decide the steps, calling your tools in a loop until the goal is reached.",
+        "example": "result = agent('Find the top 5 AI news stories today', tools=[tools.fetch_page, tools.fetch_links])",
+        "config_keys": [],
+    },
+    {
+        "name": "secret",
+        "category": "config",
+        "signature": "secret(name, scope='agent') → str",
+        "description": "Read a secret stored in Settings → Secrets. scope='agent' falls back to workspace secrets.",
+        "example": "api_key = secret('OPENAI_KEY')",
+        "config_keys": [],
+    },
+    {
+        "name": "wait_for_human",
+        "category": "approvals",
+        "signature": "wait_for_human(message, context=None, timeout_hours=24, default='reject') → {approved, text, reason}",
+        "description": "Pause the run and ask the owner to approve or reject. The run resumes when they respond.",
+        "example": "decision = wait_for_human('Ready to send invoice', context={'amount': 1200})\nif decision['approved']:\n    tools.send_email(...)",
+        "config_keys": [],
+    },
+    {
+        "name": "call_agent",
+        "category": "agents",
+        "signature": "call_agent(agent_name_or_id, payload={}, timeout=300) → any",
+        "description": "Call another agent and wait for its result.",
+        "example": "report = call_agent('weekly-report', payload={'week': '2024-W48'})",
+        "config_keys": [],
+    },
+    {
+        "name": "spawn",
+        "category": "agents",
+        "signature": "spawn(agent_name_or_id, payload={})",
+        "description": "Fire-and-forget: start another agent without waiting for it to finish.",
+        "example": "spawn('enrich-lead', payload={'lead_id': lead['id']})",
+        "config_keys": [],
+    },
+]
+
+
+@app.get("/api/tools", dependencies=[Depends(auth)])
+def list_tools():
+    """Return the catalogue of built-in tools."""
+    return {"tools": TOOLS_CATALOGUE}
+
+
+class ToolConfigBody(BaseModel):
+    config: dict  # e.g. {"fetch": {"timeout": 60, "default_headers": {"Authorization": "Bearer x"}}, "ai": {"model": "..."}}
+
+
+@app.get("/api/agents/{agent_id}/tool-config", dependencies=[Depends(auth)])
+def get_tool_config(agent_id: str):
+    with session() as s:
+        a = get_agent(s, agent_id)
+        return {"config": a.tool_config or {}}
+
+
+@app.put("/api/agents/{agent_id}/tool-config", dependencies=[Depends(auth)])
+def put_tool_config(agent_id: str, body: ToolConfigBody):
+    with session() as s:
+        a = get_agent(s, agent_id)
+        a.tool_config = body.config
+    return {"ok": True}
+
+
 @app.delete("/api/agents/{agent_id}/memory", dependencies=[Depends(auth)])
 def clear_memory(agent_id: str):
     with session() as s:
