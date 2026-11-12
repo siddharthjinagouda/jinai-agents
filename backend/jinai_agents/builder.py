@@ -40,23 +40,16 @@ state.get("key", default) / state.set("key", value)   # memory between runs (JSO
 ai("Summarise ...", json=False)           # one Claude call; json=True returns parsed JSON
 agent(goal, tools=[fn1, fn2], max_steps=10, context=data)   # AI decides the steps, calling your Python
                                           # functions (type hints + docstring become the tool description)
-tools.fetch_page(url)        # fetch a URL, return visible text (8000 chars)
-tools.fetch_links(url)       # fetch a URL, return list of {text, url}
-tools.fetch_json(url)        # GET a JSON API, return raw JSON text
-tools.search_web(query, num=10)   # DuckDuckGo search → JSON list of {title, url, snippet}
-tools.search_news(query, num=10)  # Google News RSS → JSON list of {title, url, published, source}
-tools.fetch_rss(url, num=20)      # parse RSS/Atom feed → JSON list of {title, url, published, summary}
-tools.extract(url, schema)        # fetch page + AI extract → JSON (schema = plain English description)
-tools.post_webhook(url, payload_json, headers_json="")  # POST JSON to a webhook URL
-tools.browse(url)            # headless browser for JS-heavy pages → visible text
-tools.pdf_read(url)          # download PDF, extract text
-tools.send_email(to, subject, body)   # send email, returns 'queued'
-tools.slack_post(channel, text, token_secret="SLACK_TOKEN")  # post to Slack
-tools.store_insert(table, row_json)   # insert JSON row into store table
-tools.store_query(table, where_json="")  # query store table, returns JSON rows
-tools.sheets_read(spreadsheet_id, range_, token_secret="GOOGLE_TOKEN")   # read Google Sheet rows
-tools.sheets_write(spreadsheet_id, range_, rows_json, token_secret="GOOGLE_TOKEN")  # write Google Sheet
-# Pass any of the above to agent(goal, tools=[tools.search_web, tools.fetch_page, ...])
+# For agent(), define tool functions inline in agent.py — any Python function with a docstring works:
+# def get_prices(url: str) -> str:
+#     """Fetch a product page and return its prices as JSON."""
+#     page = fetch(url)
+#     return json.dumps([el.text for el in page.select(".price")])
+#
+# result = agent("Find the cheapest option", tools=[get_prices])
+#
+# The function's name + docstring tell Claude what it does and when to call it.
+# Use fetch(), ai(), store, secret() inside tool functions — they're always available.
 notify(message, subject=None, to=None)    # email to the owner (sent after the run, only if checks passed)
 secret("SLACK_TOKEN")                     # owner-provided secret; raises MissingSecret if not set
 prompt("research", company=name)          # loads prompts/research.md, fills {{company}}
