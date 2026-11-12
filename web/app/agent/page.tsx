@@ -39,6 +39,7 @@ function AgentPage() {
   const [memoryItems, setMemoryItems] = useState<MemoryItem[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
+  const [githubRepo, setGithubRepo] = useState<string | null>(null);
   const [files, setFiles] = useState<Record<string, string>>({});
   const [activeFile, setActiveFile] = useState("agent.py");
   const [localDirty, setLocalDirty] = useState(false);
@@ -72,11 +73,13 @@ function AgentPage() {
 
   const load = useCallback(async () => {
     if (!id) return;
-    const [d, m, r] = await Promise.all([
+    const [d, m, r, gh] = await Promise.all([
       api<AgentDetail>(`/api/agents/${id}`),
       api<Msg[]>(`/api/agents/${id}/messages?after=${lastMsg.current}`),
       api<RunBrief[]>(`/api/agents/${id}/runs?limit=40`),
+      api<{ repo: string | null; url: string | null }>(`/api/agents/${id}/github`).catch(() => ({ repo: null, url: null })),
     ]);
+    setGithubRepo(gh.url);
     setAgent(d);
     setRuns(r);
     if (m.length) {
@@ -203,6 +206,7 @@ function AgentPage() {
             <Status agent={agent} />
             <span>{agent.trigger}{agent.next_run_at ? `, next ${until(agent.next_run_at)}` : ""}</span>
             {agent.live_version && <span>Live version v{agent.live_version}{agent.draft_dirty ? " (draft has changes)" : ""}</span>}
+            {githubRepo && <a href={githubRepo} target="_blank" rel="noreferrer" style={{ fontSize: 13, opacity: 0.7 }}>GitHub ↗</a>}
             <RunStrip runs={agent.health.recent} slots={20} />
           </div>
         </div>
@@ -611,6 +615,8 @@ function SettingsView({ agent, reload, onDeleted }: { agent: AgentDetail; reload
           ))}
         </section>
 
+        <GitHubSection agentId={agent.id} />
+
         <section>
           <h2>Delete</h2>
           <div>
@@ -627,6 +633,74 @@ function SettingsView({ agent, reload, onDeleted }: { agent: AgentDetail; reload
         {msg && <p className={msg === "Saved" ? "hint" : "err"}>{msg}</p>}
       </div>
     </div>
+  );
+}
+
+// ------------------------------------------------------------------ github
+function GitHubSection({ agentId }: { agentId: string }) {
+  const [status, setStatus] = useState<{ connected: boolean; login: string; configured: boolean } | null>(null);
+  const [repoInfo, setRepoInfo] = useState<{ repo: string | null; url: string | null } | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    api<{ connected: boolean; login: string; configured: boolean }>("/api/github/status").then(setStatus).catch(() => {});
+    api<{ repo: string | null; url: string | null }>(`/api/agents/${agentId}/github`).then(setRepoInfo).catch(() => {});
+  }, [agentId]);
+
+  async function connect() {
+    try {
+      const { url } = await api<{ url: string }>("/api/github/connect");
+      window.location.href = url;
+    } catch (e: any) { setMsg(e.message); }
+  }
+
+  async function disconnect() {
+    await api("/api/github/disconnect", { method: "POST" });
+    setStatus((s) => s ? { ...s, connected: false, login: "" } : s);
+    setMsg("Disconnected");
+  }
+
+  async function sync() {
+    setSyncing(true); setMsg("");
+    try {
+      const { url } = await api<{ url: string }>(`/api/agents/${agentId}/github/sync`, { method: "POST" });
+      setRepoInfo((r) => r ? { ...r, url } : r);
+      setMsg("Pushed to GitHub ✓");
+    } catch (e: any) { setMsg(e.message); }
+    finally { setSyncing(false); }
+  }
+
+  if (!status) return null;
+  if (!status.configured) return null; // GITHUB_CLIENT_ID not set, hide section
+
+  return (
+    <section>
+      <h2>GitHub</h2>
+      {!status.connected ? (
+        <>
+          <p className="hint">Connect GitHub to sync each deploy as a commit. Each agent gets its own repo.</p>
+          <button className="btn" onClick={connect}>Connect GitHub</button>
+        </>
+      ) : (
+        <>
+          <p className="hint">Connected as <b>{status.login}</b>. Each deploy pushes to the agent's GitHub repo.</p>
+          {repoInfo?.url ? (
+            <div className="copy" style={{ marginBottom: 8 }}>
+              <input className="field mono" readOnly value={repoInfo.url} onFocus={(e) => e.target.select()} />
+              <a className="btn" href={repoInfo.url} target="_blank" rel="noreferrer">Open</a>
+            </div>
+          ) : (
+            <p className="hint" style={{ marginBottom: 8 }}>No repo yet — sync to create it.</p>
+          )}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn" disabled={syncing} onClick={sync}>{syncing ? "Syncing…" : "Sync now"}</button>
+            <button className="btn ghost small" onClick={disconnect}>Disconnect</button>
+          </div>
+        </>
+      )}
+      {msg && <p className={msg.includes("✓") ? "hint" : "err"} style={{ marginTop: 6 }}>{msg}</p>}
+    </section>
   );
 }
 

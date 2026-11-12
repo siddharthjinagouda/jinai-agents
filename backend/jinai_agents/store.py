@@ -185,6 +185,17 @@ def deploy(s, agent: Agent, files: dict, note: str, by: str) -> Version:
                 text=f"v{n} deployed" + (f": {note}" if note else "")))
     from .scheduler import schedule_next
     schedule_next(agent)
+    # Sync to GitHub in background (non-blocking, best-effort)
+    _agent_id = agent.id
+    _note = note
+    def _gh_sync():
+        try:
+            from . import github as gh
+            gh.sync_agent_to_github(_agent_id, version_note=f"Deploy v{n}" + (f": {_note}" if _note else ""))
+        except Exception:
+            pass  # GitHub sync is best-effort
+    import threading
+    threading.Thread(target=_gh_sync, daemon=True).start()
     return v
 
 

@@ -48,6 +48,10 @@ class Settings:
 
     web_dir: Path = field(default_factory=lambda: Path(_env("JINAI_WEB_DIR", str(Path(__file__).resolve().parents[2] / "web" / "out"))))
 
+    # GitHub integration (optional)
+    github_client_id: str = field(default_factory=lambda: _env("GITHUB_CLIENT_ID"))
+    github_client_secret: str = field(default_factory=lambda: _env("GITHUB_CLIENT_SECRET"))
+
 
 settings = Settings()
 

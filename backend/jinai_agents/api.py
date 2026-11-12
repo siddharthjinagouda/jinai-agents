@@ -970,6 +970,99 @@ def delete_memory(agent_id: str, item_id: str):
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- GitHub integration
+import secrets as _secrets_mod
+_github_states: dict[str, str] = {}  # state -> redirect_url
+
+@app.get("/api/github/status", dependencies=[Depends(auth)])
+def github_status():
+    from . import github as gh
+    status = gh.get_github_status()
+    status["configured"] = bool(config.settings.github_client_id)
+    return status
+
+
+@app.get("/api/github/connect", dependencies=[Depends(auth)])
+def github_connect():
+    from . import github as gh
+    state = _secrets_mod.token_urlsafe(16)
+    _github_states[state] = "/"
+    try:
+        url = gh.oauth_url(state)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"url": url}
+
+
+@app.get("/api/github/callback")
+def github_callback(code: str = "", state: str = "", error: str = ""):
+    from . import github as gh
+    if error:
+        return Response(content=f"<html><body>GitHub error: {error}. <a href='/'>Back</a></body></html>",
+                        media_type="text/html")
+    if state not in _github_states:
+        raise HTTPException(400, "Invalid state")
+    _github_states.pop(state, None)
+    try:
+        token = gh.exchange_code(code)
+        import urllib.request, json as _json
+        req = urllib.request.Request("https://api.github.com/user",
+                                     headers={"Authorization": f"Bearer {token}",
+                                              "Accept": "application/vnd.github+json",
+                                              "User-Agent": "jinai-agents/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            user = _json.loads(r.read())
+        gh.set_token(token, user.get("login", ""))
+    except Exception as e:
+        return Response(content=f"<html><body>Error: {e}. <a href='/'>Back</a></body></html>",
+                        media_type="text/html")
+    return Response(
+        content="<html><body>GitHub connected! <script>window.location='/'</script></body></html>",
+        media_type="text/html")
+
+
+@app.post("/api/github/disconnect", dependencies=[Depends(auth)])
+def github_disconnect():
+    from . import github as gh
+    gh.disconnect()
+    return {"ok": True}
+
+
+@app.post("/api/agents/{agent_id}/github/sync", dependencies=[Depends(auth)])
+def github_sync_agent(agent_id: str):
+    from . import github as gh
+    with session() as s:
+        get_agent(s, agent_id)
+    url = gh.sync_agent_to_github(agent_id)
+    if url is None:
+        raise HTTPException(400, "GitHub not connected or agent has no live version")
+    return {"url": url}
+
+
+@app.get("/api/agents/{agent_id}/github", dependencies=[Depends(auth)])
+def github_agent_info(agent_id: str):
+    with session() as s:
+        a = get_agent(s, agent_id)
+        return {"repo": a.github_repo,
+                "url": f"https://github.com/{a.github_repo}" if a.github_repo else None}
+
+
+@app.post("/api/github/webhook")
+async def github_webhook(request: Request):
+    from . import github as gh
+    body = await request.body()
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    try:
+        import json as _json
+        payload = _json.loads(body)
+        result = gh.handle_push_webhook(payload, sig)
+        return {"ok": True, "result": result}
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
 # --------------------------------------------------------------------------- web app (static export of web/)
 @app.get("/healthz")
 def healthz():

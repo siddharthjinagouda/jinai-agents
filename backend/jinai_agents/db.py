@@ -51,6 +51,19 @@ class Agent(Base):
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     builder_busy: Mapped[bool] = mapped_column(Boolean, default=False)
     builder_activity: Mapped[str] = mapped_column(String(300), default="")
+    # GitHub integration
+    github_token: Mapped[str | None] = mapped_column(Text, nullable=True)   # encrypted personal access token
+    github_repo: Mapped[str | None] = mapped_column(String(200), nullable=True)  # "owner/repo"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class WorkspaceGitHub(Base):
+    """Workspace-level GitHub OAuth token (one per jinai installation)."""
+    __tablename__ = "workspace_github"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    encrypted_token: Mapped[str] = mapped_column(Text)   # Fernet-encrypted
+    github_login: Mapped[str] = mapped_column(String(100), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
